@@ -39,10 +39,4 @@ public class TaskParams
 
     [JsonPropertyName("model")]
     public string Model { get; set; } = "base";
-
-    [JsonPropertyName("output_format")]
-    public string OutputFormat { get; set; } = "json";
-
-    [JsonPropertyName("timestamps")]
-    public bool Timestamps { get; set; } = true;
 }

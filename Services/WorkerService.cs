@@ -250,9 +250,7 @@ public class WorkerService : BackgroundService
             var taskParams = new TaskParams
             {
                 Language = paramsObj.TryGetProperty("language", out var lang) ? lang.GetString() ?? "auto" : "auto",
-                Model = paramsObj.TryGetProperty("model", out var model) ? model.GetString() ?? _config.DefaultModel : _config.DefaultModel,
-                OutputFormat = paramsObj.TryGetProperty("output_format", out var fmt) ? fmt.GetString() ?? "json" : "json",
-                Timestamps = paramsObj.TryGetProperty("timestamps", out var ts) && ts.GetBoolean()
+                Model = paramsObj.TryGetProperty("model", out var model) ? model.GetString() ?? _config.DefaultModel : _config.DefaultModel
             };
 
             // Download file
@@ -265,14 +263,15 @@ public class WorkerService : BackgroundService
             _logger.LogInformation("Starting transcription with model: {Model}, language: {Language}",
                 taskParams.Model, taskParams.Language);
 
-            var result = await _whisperProcessor.ProcessAsync(
+            await _whisperProcessor.ProcessAsync(
                 filePath,
                 taskParams,
                 progress => _ = SendProgressAsync(taskId, progress),
+                (start, end, text) => _ = SendSegmentAsync(taskId, start, end, text),
                 CancellationToken.None);
 
-            // Send result
-            await _hubConnection!.InvokeAsync("Result", new { TaskId = Guid.Parse(taskId), Status = "Completed", Output = JsonSerializer.SerializeToDocument(result) });
+            // Send completion (segments already sent via callback, stored in Redis, will be persisted on completion)
+            await _hubConnection!.InvokeAsync("Result", new { TaskId = Guid.Parse(taskId) });
             _logger.LogInformation("Task {TaskId} completed successfully", taskId);
         }
         catch (Exception ex)
@@ -304,6 +303,18 @@ public class WorkerService : BackgroundService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to send progress update");
+        }
+    }
+
+    private async Task SendSegmentAsync(string taskId, TimeSpan start, TimeSpan end, string text)
+    {
+        try
+        {
+            await _hubConnection!.InvokeAsync("Segment", new { TaskId = Guid.Parse(taskId), Start = start.ToString(@"hh\:mm\:ss"), End = end.ToString(@"hh\:mm\:ss"), Text = text });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send segment");
         }
     }
 

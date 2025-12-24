@@ -32,15 +32,16 @@ public class WhisperProcessor : IDisposable
         _modelPath = modelPath;
     }
 
-    public async Task<object> ProcessAsync(
+    public async Task ProcessAsync(
         string audioPath,
         TaskParams taskParams,
         Action<int> onProgress,
+        Action<TimeSpan, TimeSpan, string> onSegment,
         CancellationToken ct)
     {
         _lastLoggedProgress = -1;
         Console.WriteLine($"[WhisperProcessor] Starting processing: audioPath={audioPath}, model={taskParams.Model}, language={taskParams.Language}");
-        
+
         var modelFile = GetModelFilePath(taskParams.Model);
         if (!File.Exists(modelFile))
         {
@@ -48,8 +49,6 @@ public class WhisperProcessor : IDisposable
         }
 
         var factory = GetOrCreateFactory(modelFile);
-
-        var segments = new List<SegmentData>();
 
         await using var processor = factory.CreateBuilder()
             .WithLanguage(taskParams.Language == "auto" ? "auto" : taskParams.Language)
@@ -65,23 +64,22 @@ public class WhisperProcessor : IDisposable
             .WithSegmentEventHandler(segment =>
             {
                 Console.WriteLine($"[WhisperProcessor] Live segment: {segment.Start} - {segment.End}: {segment.Text?.Substring(0, Math.Min(50, segment.Text?.Length ?? 0))}...");
-                segments.Add(segment);
+                onSegment(segment.Start, segment.End, segment.Text ?? "");
             })
             .Build();
 
         Console.WriteLine($"[WhisperProcessor] Opening audio file and starting transcription...");
-        
+
         // Convert audio/video to 16kHz WAV format that Whisper requires
         await using var audioStream = await ConvertToWhisperFormatAsync(audioPath, ct);
-        
+
         // ProcessAsync still needs to be consumed to drive the processing
         await foreach (var _ in processor.ProcessAsync(audioStream, ct))
         {
             // Segments are already captured via WithSegmentEventHandler
         }
 
-        Console.WriteLine($"[WhisperProcessor] Processing complete. Total segments: {segments.Count}");
-        return OutputFormatter.Format(segments, taskParams.OutputFormat, taskParams.Timestamps);
+        Console.WriteLine($"[WhisperProcessor] Processing complete.");
     }
 
     /// <summary>
@@ -91,7 +89,7 @@ public class WhisperProcessor : IDisposable
     private async Task<MemoryStream> ConvertToWhisperFormatAsync(string inputPath, CancellationToken ct)
     {
         var extension = Path.GetExtension(inputPath);
-        
+
         if (!SupportedAudioExtensions.Contains(extension) && !SupportedVideoExtensions.Contains(extension))
         {
             throw new NotSupportedException(
@@ -148,16 +146,16 @@ public class WhisperProcessor : IDisposable
 
         // Reset stream position to beginning for reading
         wavStream.Seek(0, SeekOrigin.Begin);
-        
+
         Console.WriteLine($"[WhisperProcessor] Conversion complete. Stream size: {wavStream.Length} bytes");
-        
+
         return wavStream;
     }
 
     /// <summary>
     /// Gets all supported file extensions (audio and video).
     /// </summary>
-    public static IEnumerable<string> GetSupportedExtensions() => 
+    public static IEnumerable<string> GetSupportedExtensions() =>
         SupportedAudioExtensions.Concat(SupportedVideoExtensions);
 
     /// <summary>
