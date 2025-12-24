@@ -19,6 +19,7 @@ The easiest way to run a worker is through the admin panel:
 3. Run it on any machine with Docker
 
 ### GPU Command (Faster)
+
 ```bash
 docker run -d --name my-worker-gpu --gpus all \
   -e WORKER__Name=my-worker-gpu \
@@ -29,6 +30,7 @@ docker run -d --name my-worker-gpu --gpus all \
 ```
 
 ### CPU Command (No GPU required)
+
 ```bash
 docker run -d --name my-worker-cpu \
   -e WORKER__Name=my-worker-cpu \
@@ -45,6 +47,7 @@ See repository wiki for complete setup instructions, configuration options, and 
 ## Docker Images
 
 Images are automatically built and published to GitHub Container Registry:
+
 - `ghcr.io/mitrevstudio/whisper-worker:latest` (GPU)
 - `ghcr.io/mitrevstudio/whisper-worker:gpu` (GPU)
 - `ghcr.io/mitrevstudio/whisper-worker:cpu` (CPU-only)

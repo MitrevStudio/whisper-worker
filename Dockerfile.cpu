@@ -19,8 +19,9 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 ARG BUILD_CONFIGURATION=Release
 WORKDIR /src
 COPY ["worker.csproj", "."]
-# Remove CUDA references for CPU build to ensure no GPU dependencies are included
-RUN sed -i '/Whisper.net.Runtime.Cuda/d' worker.csproj
+# Remove CUDA references and add NoAvx runtime for CPU-only builds
+RUN sed -i '/Whisper.net.Runtime.Cuda/d' worker.csproj && \
+    sed -i 's|<PackageReference Include="Whisper.net.Runtime" Version="1.9.0" />|<PackageReference Include="Whisper.net.Runtime" Version="1.9.0" />\n    <PackageReference Include="Whisper.net.Runtime.NoAvx" Version="1.9.0" />|' worker.csproj
 RUN dotnet restore "./worker.csproj"
 COPY . .
 WORKDIR "/src/."
