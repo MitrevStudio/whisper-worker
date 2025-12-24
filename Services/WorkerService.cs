@@ -5,6 +5,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Worker.Models;
+using static System.Net.Mime.MediaTypeNames;
 
 namespace Worker.Services;
 
@@ -23,12 +24,13 @@ public class WorkerService : BackgroundService
     public WorkerService(
         ILogger<WorkerService> logger,
         IOptions<WorkerConfig> config,
-        HttpClient httpClient)
+        HttpClient httpClient,
+        ILoggerFactory loggerFactory)
     {
         _logger = logger;
         _config = config.Value;
         _httpClient = httpClient;
-        _whisperProcessor = new WhisperProcessor(_config.ModelPath);
+        _whisperProcessor = new WhisperProcessor(_config.ModelPath, loggerFactory.CreateLogger<WhisperProcessor>());
         _fileDownloader = new FileDownloader(_httpClient, _config.TempPath);
     }
 
@@ -91,19 +93,31 @@ public class WorkerService : BackgroundService
     {
         _logger.LogInformation("Performing startup checks...");
 
+        // Validate and secure model path
+        if (!ValidateDirectoryPath(_config.ModelPath, "Model path"))
+        {
+            return false;
+        }
+
         // Ensure model path exists
         if (!Directory.Exists(_config.ModelPath))
         {
-            _logger.LogInformation("Model path does not exist, creating: {Path}", _config.ModelPath);
+            _logger.LogInformation("Model path does not exist, creating");
             try
             {
                 Directory.CreateDirectory(_config.ModelPath);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to create model path: {Path}", _config.ModelPath);
+                _logger.LogError(ex, "Failed to create model path");
                 return false;
             }
+        }
+
+        // Validate and secure temp path
+        if (!ValidateDirectoryPath(_config.TempPath, "Temp path"))
+        {
+            return false;
         }
 
         // Check temp path is writable
@@ -116,7 +130,7 @@ public class WorkerService : BackgroundService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Temp path is not writable: {Path}", _config.TempPath);
+            _logger.LogError(ex, "Temp path is not writable");
             return false;
         }
 
@@ -133,15 +147,75 @@ public class WorkerService : BackgroundService
             return false;
         }
 
-        // Check API URL is configured
+        // Check and validate API URL
         if (string.IsNullOrEmpty(_config.ApiUrl))
         {
             _logger.LogError("API URL is not configured");
             return false;
         }
 
+        if (!ValidateApiUrl(_config.ApiUrl))
+        {
+            return false;
+        }
+
         _logger.LogInformation("All startup checks passed");
         return true;
+    }
+
+    private bool ValidateDirectoryPath(string path, string pathName)
+    {
+        try
+        {
+            // Ensure path is absolute
+            if (!Path.IsPathFullyQualified(path))
+            {
+                _logger.LogError("{PathName} must be an absolute path", pathName);
+                return false;
+            }
+
+            // Get full path and check for traversal attempts
+            var fullPath = Path.GetFullPath(path);
+
+            // Verify the path is valid (no null characters, etc.)
+            if (fullPath.Contains('\0'))
+            {
+                _logger.LogError("{PathName} contains invalid characters", pathName);
+                return false;
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "{PathName} validation failed", pathName);
+            return false;
+        }
+    }
+
+    private bool ValidateApiUrl(string apiUrl)
+    {
+        try
+        {
+            if (!Uri.TryCreate(apiUrl, UriKind.Absolute, out var apiUri))
+            {
+                _logger.LogError("Invalid API URL format");
+                return false;
+            }
+
+            if (apiUri.Scheme != Uri.UriSchemeHttps && apiUri.Scheme != Uri.UriSchemeHttp)
+            {
+                _logger.LogError("API URL must use HTTP or HTTPS scheme");
+                return false;
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "API URL validation failed");
+            return false;
+        }
     }
 
     private async Task<bool> ConnectToApiAsync(CancellationToken ct)
@@ -154,12 +228,12 @@ public class WorkerService : BackgroundService
             {
                 options.AccessTokenProvider = () => Task.FromResult<string?>(_config.Token);
             })
-            .WithAutomaticReconnect(new[] { TimeSpan.Zero, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(10) })
+            .WithAutomaticReconnect(new InfiniteRetryPolicy())
             .Build();
 
         // Setup handlers
         _hubConnection.On<string>("Registered", OnRegistered);
-        _hubConnection.On<JsonElement>("ReceiveTask", OnReceiveTask);
+        _hubConnection.On<JsonElement>("ReceiveTask", OnReceiveTaskSafe);
 
         _hubConnection.Closed += async (error) =>
         {
@@ -193,6 +267,18 @@ public class WorkerService : BackgroundService
         }
     }
 
+    // Custom reconnect policy that retries indefinitely every 5 minutes
+    private class InfiniteRetryPolicy : IRetryPolicy
+    {
+        private readonly TimeSpan _retryDelay = TimeSpan.FromMinutes(5);
+
+        public TimeSpan? NextRetryDelay(RetryContext context)
+        {
+            // Always return 5 minutes delay, never stop retrying
+            return _retryDelay;
+        }
+    }
+
     private async Task RegisterAsync(CancellationToken ct)
     {
         _logger.LogInformation("Registering worker with API...");
@@ -215,7 +301,13 @@ public class WorkerService : BackgroundService
         _logger.LogInformation("Worker registered with ID: {Id}", workerId);
     }
 
-    private async void OnReceiveTask(JsonElement taskElement)
+    private void OnReceiveTaskSafe(JsonElement taskElement)
+    {
+        // Fire and forget, but wrap to prevent unhandled exceptions from crashing the worker
+        _ = HandleTaskSafelyAsync(taskElement);
+    }
+
+    private async Task HandleTaskSafelyAsync(JsonElement taskElement)
     {
         if (_state == WorkerState.Busy)
         {
@@ -247,17 +339,30 @@ public class WorkerService : BackgroundService
                 : "";
 
             var paramsObj = taskData.GetProperty("params");
+            var language = paramsObj.TryGetProperty("language", out var lang) ? lang.GetString() ?? "auto" : "auto";
+            var model = paramsObj.TryGetProperty("model", out var modelProp) ? modelProp.GetString() ?? _config.DefaultModel : _config.DefaultModel;
+
+            // Validate task parameters
+            if (!ValidateLanguage(language, out var validatedLanguage))
+            {
+                throw new ArgumentException($"Unsupported language: {language}");
+            }
+
+            if (!ValidateModel(model, out var validatedModel))
+            {
+                throw new ArgumentException($"Unsupported model: {model}");
+            }
+
             var taskParams = new TaskParams
             {
-                Language = paramsObj.TryGetProperty("language", out var lang) ? lang.GetString() ?? "auto" : "auto",
-                Model = paramsObj.TryGetProperty("model", out var model) ? model.GetString() ?? _config.DefaultModel : _config.DefaultModel
+                Language = validatedLanguage,
+                Model = validatedModel
             };
 
             // Download file
-            _logger.LogInformation("Downloading file from {Url}", downloadUrl);
+            _logger.LogInformation("Downloading file for task: {TaskId}", taskId);
             await SendProgressAsync(taskId, 0);
             filePath = await _fileDownloader.DownloadAsync(downloadUrl, checksum, CancellationToken.None);
-            _logger.LogInformation("File downloaded to {Path}", filePath);
 
             // Process with Whisper
             _logger.LogInformation("Starting transcription with model: {Model}, language: {Language}",
@@ -274,12 +379,36 @@ public class WorkerService : BackgroundService
             await _hubConnection!.InvokeAsync("Result", new { TaskId = Guid.Parse(taskId) });
             _logger.LogInformation("Task {TaskId} completed successfully", taskId);
         }
-        catch (Exception ex)
+        catch (JsonException ex)
         {
-            _logger.LogError(ex, "Task {TaskId} failed", taskId);
+            _logger.LogError(ex, "Failed to parse task data");
             if (taskId is not null)
             {
-                await SendErrorAsync(taskId, ex.Message);
+                await SendErrorAsync(taskId, "Invalid task format");
+            }
+        }
+        catch (ArgumentException ex)
+        {
+            _logger.LogError(ex, "Task {TaskId} has invalid parameters", taskId);
+            if (taskId is not null)
+            {
+                await SendErrorAsync(taskId, "Invalid task parameters");
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogWarning("Task {TaskId} was cancelled", taskId);
+            if (taskId is not null)
+            {
+                await SendErrorAsync(taskId, "Task was cancelled");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Task {TaskId} failed with error", taskId);
+            if (taskId is not null)
+            {
+                await SendErrorAsync(taskId, "Task processing failed");
             }
         }
         finally
@@ -292,6 +421,44 @@ public class WorkerService : BackgroundService
             _state = WorkerState.Idle;
             _logger.LogInformation("Worker is now IDLE");
         }
+    }
+
+    private bool ValidateLanguage(string language, out string validatedLanguage)
+    {
+        validatedLanguage = language;
+
+        // Validate length
+        if (string.IsNullOrWhiteSpace(language) || language.Length > 20)
+        {
+            return false;
+        }
+
+        // Must be in supported languages list
+        if (!_config.SupportedLanguages.Contains(language))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private bool ValidateModel(string model, out string validatedModel)
+    {
+        validatedModel = model;
+
+        // Validate length
+        if (string.IsNullOrWhiteSpace(model) || model.Length > 20)
+        {
+            return false;
+        }
+
+        // Must be in supported models list
+        if (!_config.SupportedModels.Contains(model))
+        {
+            return false;
+        }
+
+        return true;
     }
 
     private async Task SendProgressAsync(string taskId, int progress)

@@ -1,5 +1,6 @@
 using FFMpegCore;
 using FFMpegCore.Pipes;
+using Microsoft.Extensions.Logging;
 using Whisper.net;
 using Whisper.net.Ggml;
 using Worker.Models;
@@ -9,6 +10,7 @@ namespace Worker.Services;
 public class WhisperProcessor : IDisposable
 {
     private readonly string _modelPath;
+    private readonly ILogger<WhisperProcessor>? _logger;
     private readonly Dictionary<string, WhisperFactory> _factories = new();
     private readonly object _lock = new();
     private int _lastLoggedProgress = -1;
@@ -27,9 +29,10 @@ public class WhisperProcessor : IDisposable
         ".3gp", ".3g2", ".ogv", ".ts", ".mts", ".m2ts", ".vob", ".rm", ".rmvb", ".asf"
     };
 
-    public WhisperProcessor(string modelPath)
+    public WhisperProcessor(string modelPath, ILogger<WhisperProcessor>? logger = null)
     {
         _modelPath = modelPath;
+        _logger = logger;
     }
 
     public async Task ProcessAsync(
@@ -40,7 +43,7 @@ public class WhisperProcessor : IDisposable
         CancellationToken ct)
     {
         _lastLoggedProgress = -1;
-        Console.WriteLine($"[WhisperProcessor] Starting processing: audioPath={audioPath}, model={taskParams.Model}, language={taskParams.Language}");
+        _logger?.LogInformation("Starting transcription processing");
 
         var modelFile = GetModelFilePath(taskParams.Model);
         if (!File.Exists(modelFile))
@@ -56,19 +59,18 @@ public class WhisperProcessor : IDisposable
             {
                 if (progress != _lastLoggedProgress)
                 {
-                    Console.WriteLine($"[WhisperProcessor] Progress callback invoked: {progress}%");
+                    _logger?.LogDebug("Processing progress: {Progress}%", progress);
                     _lastLoggedProgress = progress;
                 }
                 onProgress(progress);
             })
             .WithSegmentEventHandler(segment =>
             {
-                Console.WriteLine($"[WhisperProcessor] Live segment: {segment.Start} - {segment.End}: {segment.Text?.Substring(0, Math.Min(50, segment.Text?.Length ?? 0))}...");
                 onSegment(segment.Start, segment.End, segment.Text ?? "");
             })
             .Build();
 
-        Console.WriteLine($"[WhisperProcessor] Opening audio file and starting transcription...");
+        _logger?.LogDebug("Starting audio transcription");
 
         // Convert audio/video to 16kHz WAV format that Whisper requires
         await using var audioStream = await ConvertToWhisperFormatAsync(audioPath, ct);
@@ -79,7 +81,7 @@ public class WhisperProcessor : IDisposable
             // Segments are already captured via WithSegmentEventHandler
         }
 
-        Console.WriteLine($"[WhisperProcessor] Processing complete.");
+        _logger?.LogInformation("Transcription processing completed");
     }
 
     /// <summary>
@@ -98,7 +100,7 @@ public class WhisperProcessor : IDisposable
         }
 
         var isVideo = SupportedVideoExtensions.Contains(extension);
-        Console.WriteLine($"[WhisperProcessor] Converting {(isVideo ? "video" : "audio")} file to 16kHz mono WAV format using FFmpeg...");
+        _logger?.LogDebug("Converting {MediaType} file to 16kHz mono WAV format", isVideo ? "video" : "audio");
 
         var wavStream = new MemoryStream();
 
@@ -147,7 +149,7 @@ public class WhisperProcessor : IDisposable
         // Reset stream position to beginning for reading
         wavStream.Seek(0, SeekOrigin.Begin);
 
-        Console.WriteLine($"[WhisperProcessor] Conversion complete. Stream size: {wavStream.Length} bytes");
+        _logger?.LogDebug("Media conversion completed. Size: {SizeBytes} bytes", wavStream.Length);
 
         return wavStream;
     }
@@ -187,7 +189,7 @@ public class WhisperProcessor : IDisposable
             };
         }
 
-        Console.WriteLine($"Downloading Model {modelName} to {destinationPath}...");
+        _logger?.LogInformation("Downloading model: {ModelName}", modelName);
 
         // Ensure directory exists
         var directory = Path.GetDirectoryName(destinationPath);
@@ -199,7 +201,7 @@ public class WhisperProcessor : IDisposable
         using var modelStream = await WhisperGgmlDownloader.Default.GetGgmlModelAsync(ggmlType, cancellationToken: ct);
         using var fileWriter = File.OpenWrite(destinationPath);
         await modelStream.CopyToAsync(fileWriter, ct);
-        Console.WriteLine($"Model {modelName} downloaded successfully.");
+        _logger?.LogInformation("Model downloaded successfully");
     }
 
     private WhisperFactory GetOrCreateFactory(string modelFile)
