@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: whisper-worker:latest
+    environment:
+      WORKER__Name: whisper-worker
+      WORKER__ApiUrl: http://192.168.50.26:5239
+      WORKER__Token: "sk-worker-3JEVjqM4ca1l2umvlawvASZ6IWipinu6NqAvrrTsg6Li0IT8" # set your token here or via external env/secret
+      WORKER__ModelPath: /models
+      WORKER__TempPath: /tmp/whisper
+      WORKER__HeartbeatIntervalSeconds: 30
+      # Optional: override supported lists via env if needed
+      # WORKER__SupportedTasks__0: transcription
+      # WORKER__SupportedFormats__0: txt
+      # WORKER__SupportedFormats__1: json
+      # WORKER__SupportedFormats__2: srt
+      # WORKER__SupportedFormats__3: vtt
+      # WORKER__SupportedLanguages__0: auto
+      # WORKER__SupportedLanguages__1: en
+      # WORKER__SupportedModels__0: tiny
+      # WORKER__SupportedModels__1: base
+      # WORKER__SupportedModels__2: small
+      # WORKER__SupportedModels__3: medium
+      # WORKER__SupportedModels__4: large
+    volumes:
+      - whisper_models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: ["gpu"]
+
+volumes:
+  whisper_models:
+    driver: local

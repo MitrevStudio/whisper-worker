@@ -46,6 +46,10 @@ public class WorkerService : BackgroundService
                 return;
             }
 
+            // Configure HttpClient with auth token
+            _httpClient.DefaultRequestHeaders.Authorization =
+                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _config.Token);
+
             // Connect to API
             if (!await ConnectToApiAsync(stoppingToken))
             {
