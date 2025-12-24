@@ -20,9 +20,9 @@ ARG BUILD_CONFIGURATION=Release
 WORKDIR /src
 COPY ["worker.csproj", "."]
 # Remove CUDA references and add NoAvx runtime for CPU-only builds
-RUN sed -i '/Whisper.net.Runtime.Cuda/d' worker.csproj && \
-    sed -i 's|<PackageReference Include="Whisper.net.Runtime" Version="1.9.0" />|<PackageReference Include="Whisper.net.Runtime" Version="1.9.0" />\n    <PackageReference Include="Whisper.net.Runtime.NoAvx" Version="1.9.0" />|' worker.csproj
+RUN sed -i '/Whisper.net.Runtime.Cuda/d' worker.csproj
 RUN dotnet restore "./worker.csproj"
+RUN dotnet add package Whisper.net.Runtime.NoAvx --version 1.9.0
 COPY . .
 WORKDIR "/src/."
 RUN dotnet build "./worker.csproj" -c $BUILD_CONFIGURATION -o /app/build
