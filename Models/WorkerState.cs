@@ -5,5 +5,6 @@ public enum WorkerState
     Starting,
     Idle,
     Busy,
+    Reconnecting,
     Error
 }

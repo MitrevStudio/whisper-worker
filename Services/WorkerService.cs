@@ -20,6 +20,7 @@ public class WorkerService : BackgroundService
     private HubConnection? _hubConnection;
     private WorkerState _state = WorkerState.Starting;
     private string? _currentTaskId;
+    private int _connectionAttempt = 0;
 
     public WorkerService(
         ILogger<WorkerService> logger,
@@ -52,13 +53,8 @@ public class WorkerService : BackgroundService
             _httpClient.DefaultRequestHeaders.Authorization =
                 new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _config.Token);
 
-            // Connect to API
-            if (!await ConnectToApiAsync(stoppingToken))
-            {
-                _state = WorkerState.Error;
-                _logger.LogCritical("Failed to connect to API. Worker cannot start.");
-                return;
-            }
+            // Connect to API with infinite retry
+            await ConnectWithRetryAsync(stoppingToken);
 
             // Register with API (SignalR handshake)
             await RegisterAsync(stoppingToken);
@@ -218,32 +214,73 @@ public class WorkerService : BackgroundService
         }
     }
 
+    private async Task ConnectWithRetryAsync(CancellationToken ct)
+    {
+        _connectionAttempt = 0;
+
+        while (!ct.IsCancellationRequested)
+        {
+            _connectionAttempt++;
+            _logger.LogInformation("Connection attempt #{Attempt} to API...", _connectionAttempt);
+
+            try
+            {
+                if (await ConnectToApiAsync(ct))
+                {
+                    _logger.LogInformation("Successfully connected to API on attempt #{Attempt}", _connectionAttempt);
+                    _connectionAttempt = 0;
+                    return;
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Connection attempt #{Attempt} failed", _connectionAttempt);
+            }
+
+            var delaySeconds = Math.Min(30, 5 * _connectionAttempt); // Progressive delay: 5s, 10s, 15s, ... up to 30s
+            _logger.LogInformation("Retrying connection in {Delay} seconds (attempt #{Attempt})...", delaySeconds, _connectionAttempt);
+
+            await Task.Delay(TimeSpan.FromSeconds(delaySeconds), ct);
+        }
+
+        ct.ThrowIfCancellationRequested();
+    }
+
     private async Task<bool> ConnectToApiAsync(CancellationToken ct)
     {
         var hubUrl = $"{_config.ApiUrl.TrimEnd('/')}/ws/worker";
         _logger.LogInformation("Connecting to API at {Url}...", hubUrl);
 
+        // Dispose old connection if exists
+        if (_hubConnection is not null)
+        {
+            await _hubConnection.DisposeAsync();
+            _hubConnection = null;
+        }
+
         _hubConnection = new HubConnectionBuilder()
             .WithUrl(hubUrl, options =>
             {
                 options.AccessTokenProvider = () => Task.FromResult<string?>(_config.Token);
+                options.Headers.Add("Authorization", $"Bearer {_config.Token}");
             })
-            .WithAutomaticReconnect(new InfiniteRetryPolicy())
+            .WithAutomaticReconnect(new InfiniteRetryPolicy(_logger))
             .Build();
 
         // Setup handlers
         _hubConnection.On<string>("Registered", OnRegistered);
         _hubConnection.On<JsonElement>("ReceiveTask", OnReceiveTaskSafe);
 
-        _hubConnection.Closed += async (error) =>
-        {
-            _logger.LogWarning(error, "Connection closed");
-            _state = WorkerState.Error;
-        };
+        _hubConnection.Closed += OnConnectionClosed;
 
         _hubConnection.Reconnecting += (error) =>
         {
             _logger.LogWarning(error, "Connection lost, reconnecting...");
+            _state = WorkerState.Reconnecting;
             return Task.CompletedTask;
         };
 
@@ -267,15 +304,50 @@ public class WorkerService : BackgroundService
         }
     }
 
-    // Custom reconnect policy that retries indefinitely every 5 minutes
+    private async Task OnConnectionClosed(Exception? error)
+    {
+        // This is called only when automatic reconnect gives up (never with InfiniteRetryPolicy)
+        // or when the connection is explicitly stopped
+        _logger.LogError(error, "Connection closed permanently. Worker entering error state.");
+        _state = WorkerState.Error;
+
+        // Note: With InfiniteRetryPolicy, this should never be called during normal operation.
+        // If we reach here, something is seriously wrong (e.g., token revoked, worker deleted)
+    }
+
+    // Custom reconnect policy that retries indefinitely with progressive delays
     private class InfiniteRetryPolicy : IRetryPolicy
     {
-        private readonly TimeSpan _retryDelay = TimeSpan.FromMinutes(5);
+        private readonly ILogger _logger;
+        private static readonly TimeSpan[] _retryDelays =
+        [
+            TimeSpan.FromSeconds(0),
+            TimeSpan.FromSeconds(2),
+            TimeSpan.FromSeconds(5),
+            TimeSpan.FromSeconds(10),
+            TimeSpan.FromSeconds(30),
+            TimeSpan.FromSeconds(60),
+            TimeSpan.FromMinutes(2),
+            TimeSpan.FromMinutes(5)
+        ];
+
+        public InfiniteRetryPolicy(ILogger logger)
+        {
+            _logger = logger;
+        }
 
         public TimeSpan? NextRetryDelay(RetryContext context)
         {
-            // Always return 5 minutes delay, never stop retrying
-            return _retryDelay;
+            var attempt = context.PreviousRetryCount + 1;
+            var delay = _retryDelays[Math.Min(context.PreviousRetryCount, _retryDelays.Length - 1)];
+
+            _logger.LogInformation(
+                "Reconnect attempt #{Attempt} scheduled in {Delay} seconds...",
+                attempt,
+                delay.TotalSeconds);
+
+            // Always return a delay, never stop retrying
+            return delay;
         }
     }
 
