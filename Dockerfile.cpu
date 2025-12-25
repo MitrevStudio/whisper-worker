@@ -18,19 +18,21 @@ RUN mkdir -p /models /tmp/whisper
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 ARG BUILD_CONFIGURATION=Release
 WORKDIR /src
-COPY ["worker.csproj", "."]
-# Remove CUDA references and add NoAvx runtime for CPU-only builds
-RUN sed -i '/Whisper.net.Runtime.Cuda/d' worker.csproj
-RUN dotnet restore "./worker.csproj"
-RUN dotnet add package Whisper.net.Runtime.NoAvx --version 1.9.0
+
+# Copy all source files first
 COPY . .
-WORKDIR "/src/."
-RUN dotnet build "./worker.csproj" -c $BUILD_CONFIGURATION -o /app/build
+
+# Remove CUDA references and add NoAvx runtime for CPU-only builds
+RUN sed -i '/Whisper.net.Runtime.Cuda/d' worker.csproj && \
+    dotnet add package Whisper.net.Runtime.NoAvx --version 1.9.0
+
+RUN dotnet restore "./worker.csproj"
+RUN dotnet build "./worker.csproj" -c $BUILD_CONFIGURATION -o /app/build --no-restore
 
 # This stage is used to publish the service project to be copied to the final stage
 FROM build AS publish
 ARG BUILD_CONFIGURATION=Release
-RUN dotnet publish "./worker.csproj" -c $BUILD_CONFIGURATION -o /app/publish /p:UseAppHost=false
+RUN dotnet publish "./worker.csproj" -c $BUILD_CONFIGURATION -o /app/publish /p:UseAppHost=false --no-restore
 
 # This stage is used in production or when running from VS in regular mode
 FROM base AS final
