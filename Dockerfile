@@ -3,11 +3,11 @@
 #
 # See https://aka.ms/customizecontainer to learn how to customize your debug container
 
-# CUDA 12 base image for GPU support
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 AS base
+# CUDA 13 base image for GPU support (whisper.net 1.9.0 requires CUDA 13)
+FROM nvidia/cuda:13.1.0-runtime-ubuntu22.04 AS base
 
 # Install .NET runtime and FFmpeg for audio/video conversion
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     ca-certificates \
     ffmpeg \
@@ -51,6 +51,9 @@ ENV WORKER__Token=
 ENV WORKER__ModelPath=/models
 ENV WORKER__TempPath=/tmp/whisper
 ENV WORKER__HeartbeatIntervalSeconds=30
+
+# Set library path for CUDA runtime to find whisper native libs
+ENV LD_LIBRARY_PATH=/app/runtimes/cuda/linux-x64:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 
 # Models volume mount point
 VOLUME ["/models"]

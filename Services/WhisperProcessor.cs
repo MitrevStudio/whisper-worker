@@ -3,6 +3,7 @@ using FFMpegCore.Pipes;
 using Microsoft.Extensions.Logging;
 using Whisper.net;
 using Whisper.net.Ggml;
+using Whisper.net.LibraryLoader;
 using Worker.Models;
 
 namespace Worker.Services;
@@ -14,6 +15,8 @@ public class WhisperProcessor : IDisposable
     private readonly Dictionary<string, WhisperFactory> _factories = new();
     private readonly object _lock = new();
     private int _lastLoggedProgress = -1;
+    private static bool _runtimeConfigured = false;
+    private static readonly object _runtimeLock = new();
 
     // Supported audio extensions
     private static readonly HashSet<string> SupportedAudioExtensions = new(StringComparer.OrdinalIgnoreCase)
@@ -33,6 +36,46 @@ public class WhisperProcessor : IDisposable
     {
         _modelPath = modelPath;
         _logger = logger;
+        ConfigureRuntimeLibraryOrder();
+    }
+
+    /// <summary>
+    /// Configures the runtime library order to prioritize CUDA over CPU.
+    /// This ensures GPU acceleration is used when available.
+    /// </summary>
+    private void ConfigureRuntimeLibraryOrder()
+    {
+        lock (_runtimeLock)
+        {
+            if (_runtimeConfigured)
+                return;
+
+            // Check if we're running in a GPU container (CUDA libraries available)
+            var cudaPath = Path.Combine(AppContext.BaseDirectory, "runtimes", "cuda", "linux-x64");
+            var hasCudaRuntime = Directory.Exists(cudaPath) &&
+                                 Directory.GetFiles(cudaPath, "libggml-cuda-whisper.so").Length > 0;
+
+            if (hasCudaRuntime && OperatingSystem.IsLinux())
+            {
+                // Force CUDA only - don't allow CPU fallback which can mask GPU issues
+                RuntimeOptions.RuntimeLibraryOrder = new List<RuntimeLibrary>
+                {
+                    RuntimeLibrary.Cuda
+                };
+                _logger?.LogInformation("Whisper runtime configured for GPU acceleration (CUDA only)");
+            }
+            else
+            {
+                // CPU fallback for non-GPU environments
+                RuntimeOptions.RuntimeLibraryOrder = new List<RuntimeLibrary>
+                {
+                    RuntimeLibrary.Cpu
+                };
+                _logger?.LogInformation("Whisper runtime configured for CPU (no CUDA runtime found)");
+            }
+
+            _runtimeConfigured = true;
+        }
     }
 
     public async Task ProcessAsync(
@@ -210,7 +253,44 @@ public class WhisperProcessor : IDisposable
         {
             if (!_factories.TryGetValue(modelFile, out var factory))
             {
-                factory = WhisperFactory.FromPath(modelFile);
+                _logger?.LogInformation("Loading Whisper model from: {ModelFile}", modelFile);
+                _logger?.LogInformation("Configured runtime priority: {Priority}",
+                    string.Join(" -> ", RuntimeOptions.RuntimeLibraryOrder ?? new List<RuntimeLibrary>()));
+
+                // Log available runtime libraries
+                var cudaPath = Path.Combine(AppContext.BaseDirectory, "runtimes", "cuda", "linux-x64");
+                var cpuPath = Path.Combine(AppContext.BaseDirectory, "runtimes", "linux-x64");
+                _logger?.LogInformation("CUDA runtime path exists: {Exists}, Path: {Path}",
+                    Directory.Exists(cudaPath), cudaPath);
+                _logger?.LogInformation("CPU runtime path exists: {Exists}, Path: {Path}",
+                    Directory.Exists(cpuPath), cpuPath);
+
+                if (Directory.Exists(cudaPath))
+                {
+                    var files = Directory.GetFiles(cudaPath, "*.so");
+                    _logger?.LogInformation("CUDA runtime files: {Files}", string.Join(", ", files.Select(Path.GetFileName)));
+                }
+
+                try
+                {
+                    factory = WhisperFactory.FromPath(modelFile);
+
+                    // Log the ACTUAL loaded runtime
+                    var loadedRuntime = RuntimeOptions.LoadedLibrary;
+                    _logger?.LogInformation("Whisper model loaded successfully. ACTUAL Runtime: {Runtime}",
+                        loadedRuntime?.ToString() ?? "Unknown");
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogWarning(ex, "Failed to load Whisper with preferred runtime, attempting fallback");
+                    // Reset to allow any runtime
+                    RuntimeOptions.RuntimeLibraryOrder = null;
+                    factory = WhisperFactory.FromPath(modelFile);
+                    var loadedRuntime = RuntimeOptions.LoadedLibrary;
+                    _logger?.LogInformation("Whisper model loaded with fallback. ACTUAL Runtime: {Runtime}",
+                        loadedRuntime?.ToString() ?? "Unknown");
+                }
+
                 _factories[modelFile] = factory;
             }
             return factory;
