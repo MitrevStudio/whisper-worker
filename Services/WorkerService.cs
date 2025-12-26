@@ -338,23 +338,13 @@ public class WorkerService : BackgroundService
 
         public TimeSpan? NextRetryDelay(RetryContext context)
         {
-            var attempt = context.PreviousRetryCount + 1;
             var delay = _retryDelays[Math.Min(context.PreviousRetryCount, _retryDelays.Length - 1)];
-
-            _logger.LogInformation(
-                "Reconnect attempt #{Attempt} scheduled in {Delay} seconds...",
-                attempt,
-                delay.TotalSeconds);
-
-            // Always return a delay, never stop retrying
             return delay;
         }
     }
 
     private async Task RegisterAsync(CancellationToken ct)
     {
-        _logger.LogInformation("Registering worker with API...");
-
         await _hubConnection!.InvokeAsync("Register", new
         {
             name = _config.Name,
@@ -603,7 +593,6 @@ public class WorkerService : BackgroundService
                 if (_hubConnection?.State == HubConnectionState.Connected)
                 {
                     await _hubConnection.InvokeAsync("Heartbeat", new { State = _state.ToString() }, ct);
-                    _logger.LogDebug("Heartbeat sent: {State}", _state);
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)

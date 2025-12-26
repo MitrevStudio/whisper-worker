@@ -1,5 +1,11 @@
 namespace Worker.Models;
 
+public record TaskParams
+{
+    public required string Language { get; init; }
+    public required string Model { get; init; }
+}
+
 public class WorkerConfig
 {
     public string Name { get; set; } = "whisper-worker";

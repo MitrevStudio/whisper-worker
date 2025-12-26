@@ -89,24 +89,14 @@ public class WhisperProcessor : IDisposable
         CancellationToken ct)
     {
         _lastLoggedProgress = -1;
-        var totalStopwatch = System.Diagnostics.Stopwatch.StartNew();
-        var stepStopwatch = System.Diagnostics.Stopwatch.StartNew();
-        _logger?.LogInformation("Starting transcription processing");
 
         var modelFile = GetModelFilePath(taskParams.Model);
         if (!File.Exists(modelFile))
         {
             await DownloadModelAsync(taskParams.Model, modelFile, ct);
-            _logger?.LogInformation("Model download took {ElapsedMs}ms", stepStopwatch.ElapsedMilliseconds);
         }
 
-        // Factory loading (cached after first load)
-        stepStopwatch.Restart();
         var factory = GetOrCreateFactory(modelFile);
-        _logger?.LogInformation("Factory load/cache took {ElapsedMs}ms", stepStopwatch.ElapsedMilliseconds);
-
-        // Processor build
-        stepStopwatch.Restart();
         await using var processor = factory.CreateBuilder()
             .WithLanguage(taskParams.Language == "auto" ? "auto" : taskParams.Language)
             .WithProgressHandler(progress =>
@@ -123,56 +113,12 @@ public class WhisperProcessor : IDisposable
                 onSegment(segment.Start, segment.End, segment.Text ?? "");
             })
             .Build();
-        _logger?.LogInformation("Processor build took {ElapsedMs}ms", stepStopwatch.ElapsedMilliseconds);
 
-        // Audio conversion
-        stepStopwatch.Restart();
         await using var audioStream = await ConvertToWhisperFormatAsync(audioPath, ct);
-        _logger?.LogInformation("Audio conversion took {ElapsedMs}ms", stepStopwatch.ElapsedMilliseconds);
-
-        // Transcription - collect final segments for comparison with streamed segments
-        stepStopwatch.Restart();
-        var finalSegments = new List<(TimeSpan Start, TimeSpan End, string Text)>();
         await foreach (var segment in processor.ProcessAsync(audioStream, ct))
         {
-            // Collect final segments returned by ProcessAsync
-            finalSegments.Add((segment.Start, segment.End, segment.Text ?? ""));
+            // Segments are already sent via the event handler callback
         }
-        _logger?.LogInformation("Transcription took {ElapsedMs}ms", stepStopwatch.ElapsedMilliseconds);
-
-        // Log final segments for debugging - compare with streamed segments
-        _logger?.LogInformation("=== FINAL SEGMENTS FROM ProcessAsync ({Count} segments) ===", finalSegments.Count);
-        var debugDir = Path.Combine("/tmp/whisper", $"debug_{Guid.NewGuid():N}");
-        try
-        {
-            Directory.CreateDirectory(debugDir);
-            var finalSegmentsPath = Path.Combine(debugDir, "final_segments.txt");
-            var lines = finalSegments.Select((s, i) => $"[{i:D4}] [{s.Start:hh\\:mm\\:ss\\.fff} -> {s.End:hh\\:mm\\:ss\\.fff}] {s.Text}");
-            await File.WriteAllLinesAsync(finalSegmentsPath, lines, ct);
-            _logger?.LogInformation("Final segments saved to: {Path}", finalSegmentsPath);
-            
-            // Check for duplicates in final segments
-            var duplicateCheck = finalSegments
-                .GroupBy(s => s.Text.Trim())
-                .Where(g => g.Count() > 3)
-                .Select(g => $"'{g.Key.Substring(0, Math.Min(50, g.Key.Length))}...' x{g.Count()}")
-                .ToList();
-            
-            if (duplicateCheck.Any())
-            {
-                _logger?.LogWarning("DUPLICATES IN FINAL SEGMENTS: {Duplicates}", string.Join("; ", duplicateCheck));
-            }
-            else
-            {
-                _logger?.LogInformation("No significant duplicates in final segments");
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogWarning(ex, "Failed to save final segments debug file");
-        }
-
-        _logger?.LogInformation("Transcription completed. Total time: {ElapsedMs}ms", totalStopwatch.ElapsedMilliseconds);
     }
 
     /// <summary>
@@ -301,42 +247,15 @@ public class WhisperProcessor : IDisposable
         {
             if (!_factories.TryGetValue(modelFile, out var factory))
             {
-                _logger?.LogInformation("Loading Whisper model from: {ModelFile}", modelFile);
-                _logger?.LogInformation("Configured runtime priority: {Priority}",
-                    string.Join(" -> ", RuntimeOptions.RuntimeLibraryOrder ?? new List<RuntimeLibrary>()));
-
-                // Log available runtime libraries
-                var cudaPath = Path.Combine(AppContext.BaseDirectory, "runtimes", "cuda", "linux-x64");
-                var cpuPath = Path.Combine(AppContext.BaseDirectory, "runtimes", "linux-x64");
-                _logger?.LogInformation("CUDA runtime path exists: {Exists}, Path: {Path}",
-                    Directory.Exists(cudaPath), cudaPath);
-                _logger?.LogInformation("CPU runtime path exists: {Exists}, Path: {Path}",
-                    Directory.Exists(cpuPath), cpuPath);
-
-                if (Directory.Exists(cudaPath))
-                {
-                    var files = Directory.GetFiles(cudaPath, "*.so");
-                    _logger?.LogInformation("CUDA runtime files: {Files}", string.Join(", ", files.Select(Path.GetFileName)));
-                }
-
                 try
                 {
                     factory = WhisperFactory.FromPath(modelFile);
-
-                    // Log the ACTUAL loaded runtime
-                    var loadedRuntime = RuntimeOptions.LoadedLibrary;
-                    _logger?.LogInformation("Whisper model loaded successfully. ACTUAL Runtime: {Runtime}",
-                        loadedRuntime?.ToString() ?? "Unknown");
                 }
                 catch (Exception ex)
                 {
                     _logger?.LogWarning(ex, "Failed to load Whisper with preferred runtime, attempting fallback");
-                    // Reset to allow any runtime
                     RuntimeOptions.RuntimeLibraryOrder = null;
                     factory = WhisperFactory.FromPath(modelFile);
-                    var loadedRuntime = RuntimeOptions.LoadedLibrary;
-                    _logger?.LogInformation("Whisper model loaded with fallback. ACTUAL Runtime: {Runtime}",
-                        loadedRuntime?.ToString() ?? "Unknown");
                 }
 
                 _factories[modelFile] = factory;
