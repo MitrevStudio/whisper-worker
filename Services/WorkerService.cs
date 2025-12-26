@@ -383,8 +383,18 @@ public class WorkerService : BackgroundService
     {
         if (_state == WorkerState.Busy)
         {
-            _logger.LogWarning("Received task while busy, rejecting");
-            await SendErrorAsync(_currentTaskId ?? "unknown", "Worker is busy");
+            // Extract task ID from the incoming task to reject it properly
+            try
+            {
+                var taskData = taskElement.GetProperty("data");
+                var incomingTaskId = taskData.GetProperty("task_id").GetString()!;
+                _logger.LogWarning("Received task {TaskId} while busy, rejecting and returning to queue", incomingTaskId);
+                await SendRejectAsync(incomingTaskId, "Worker is busy");
+            }
+            catch
+            {
+                _logger.LogWarning("Received task while busy but couldn't parse task ID");
+            }
             return;
         }
 
@@ -566,6 +576,19 @@ public class WorkerService : BackgroundService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to send error");
+        }
+    }
+
+    private async Task SendRejectAsync(string taskId, string reason)
+    {
+        try
+        {
+            await _hubConnection!.InvokeAsync("TaskRejected", Guid.Parse(taskId), reason);
+            _logger.LogInformation("Task {TaskId} rejected and returned to queue", taskId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send rejection for task {TaskId}", taskId);
         }
     }
 

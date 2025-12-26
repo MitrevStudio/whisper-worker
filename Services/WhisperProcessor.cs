@@ -12,8 +12,11 @@ public class WhisperProcessor : IDisposable
 {
     private readonly string _modelPath;
     private readonly ILogger<WhisperProcessor>? _logger;
-    private readonly Dictionary<string, WhisperFactory> _factories = new();
-    private readonly object _lock = new();
+
+    // Static cache for WhisperFactory instances - persists across WhisperProcessor instances
+    private static readonly Dictionary<string, WhisperFactory> _factories = new();
+    private static readonly object _factoryLock = new();
+
     private int _lastLoggedProgress = -1;
     private static bool _runtimeConfigured = false;
     private static readonly object _runtimeLock = new();
@@ -86,16 +89,24 @@ public class WhisperProcessor : IDisposable
         CancellationToken ct)
     {
         _lastLoggedProgress = -1;
+        var totalStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var stepStopwatch = System.Diagnostics.Stopwatch.StartNew();
         _logger?.LogInformation("Starting transcription processing");
 
         var modelFile = GetModelFilePath(taskParams.Model);
         if (!File.Exists(modelFile))
         {
             await DownloadModelAsync(taskParams.Model, modelFile, ct);
+            _logger?.LogInformation("Model download took {ElapsedMs}ms", stepStopwatch.ElapsedMilliseconds);
         }
 
+        // Factory loading (cached after first load)
+        stepStopwatch.Restart();
         var factory = GetOrCreateFactory(modelFile);
+        _logger?.LogInformation("Factory load/cache took {ElapsedMs}ms", stepStopwatch.ElapsedMilliseconds);
 
+        // Processor build
+        stepStopwatch.Restart();
         await using var processor = factory.CreateBuilder()
             .WithLanguage(taskParams.Language == "auto" ? "auto" : taskParams.Language)
             .WithProgressHandler(progress =>
@@ -112,19 +123,56 @@ public class WhisperProcessor : IDisposable
                 onSegment(segment.Start, segment.End, segment.Text ?? "");
             })
             .Build();
+        _logger?.LogInformation("Processor build took {ElapsedMs}ms", stepStopwatch.ElapsedMilliseconds);
 
-        _logger?.LogDebug("Starting audio transcription");
-
-        // Convert audio/video to 16kHz WAV format that Whisper requires
+        // Audio conversion
+        stepStopwatch.Restart();
         await using var audioStream = await ConvertToWhisperFormatAsync(audioPath, ct);
+        _logger?.LogInformation("Audio conversion took {ElapsedMs}ms", stepStopwatch.ElapsedMilliseconds);
 
-        // ProcessAsync still needs to be consumed to drive the processing
-        await foreach (var _ in processor.ProcessAsync(audioStream, ct))
+        // Transcription - collect final segments for comparison with streamed segments
+        stepStopwatch.Restart();
+        var finalSegments = new List<(TimeSpan Start, TimeSpan End, string Text)>();
+        await foreach (var segment in processor.ProcessAsync(audioStream, ct))
         {
-            // Segments are already captured via WithSegmentEventHandler
+            // Collect final segments returned by ProcessAsync
+            finalSegments.Add((segment.Start, segment.End, segment.Text ?? ""));
+        }
+        _logger?.LogInformation("Transcription took {ElapsedMs}ms", stepStopwatch.ElapsedMilliseconds);
+
+        // Log final segments for debugging - compare with streamed segments
+        _logger?.LogInformation("=== FINAL SEGMENTS FROM ProcessAsync ({Count} segments) ===", finalSegments.Count);
+        var debugDir = Path.Combine("/tmp/whisper", $"debug_{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(debugDir);
+            var finalSegmentsPath = Path.Combine(debugDir, "final_segments.txt");
+            var lines = finalSegments.Select((s, i) => $"[{i:D4}] [{s.Start:hh\\:mm\\:ss\\.fff} -> {s.End:hh\\:mm\\:ss\\.fff}] {s.Text}");
+            await File.WriteAllLinesAsync(finalSegmentsPath, lines, ct);
+            _logger?.LogInformation("Final segments saved to: {Path}", finalSegmentsPath);
+            
+            // Check for duplicates in final segments
+            var duplicateCheck = finalSegments
+                .GroupBy(s => s.Text.Trim())
+                .Where(g => g.Count() > 3)
+                .Select(g => $"'{g.Key.Substring(0, Math.Min(50, g.Key.Length))}...' x{g.Count()}")
+                .ToList();
+            
+            if (duplicateCheck.Any())
+            {
+                _logger?.LogWarning("DUPLICATES IN FINAL SEGMENTS: {Duplicates}", string.Join("; ", duplicateCheck));
+            }
+            else
+            {
+                _logger?.LogInformation("No significant duplicates in final segments");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning(ex, "Failed to save final segments debug file");
         }
 
-        _logger?.LogInformation("Transcription processing completed");
+        _logger?.LogInformation("Transcription completed. Total time: {ElapsedMs}ms", totalStopwatch.ElapsedMilliseconds);
     }
 
     /// <summary>
@@ -249,7 +297,7 @@ public class WhisperProcessor : IDisposable
 
     private WhisperFactory GetOrCreateFactory(string modelFile)
     {
-        lock (_lock)
+        lock (_factoryLock)
         {
             if (!_factories.TryGetValue(modelFile, out var factory))
             {
@@ -317,13 +365,8 @@ public class WhisperProcessor : IDisposable
 
     public void Dispose()
     {
-        lock (_lock)
-        {
-            foreach (var factory in _factories.Values)
-            {
-                factory.Dispose();
-            }
-            _factories.Clear();
-        }
+        // Note: Static factories are intentionally NOT disposed here
+        // They persist across WhisperProcessor instances for performance
+        // They will be cleaned up when the application shuts down
     }
 }
