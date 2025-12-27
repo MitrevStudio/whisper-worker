@@ -22,8 +22,11 @@ if (!string.IsNullOrEmpty(workerToken))
 
 builder.Services.Configure<WorkerConfig>(builder.Configuration.GetSection("Worker"));
 
-// Register HttpClient
-builder.Services.AddHttpClient<WorkerService>();
+// Register HttpClient with extended timeout for large file downloads
+builder.Services.AddHttpClient<WorkerService>(client =>
+{
+    client.Timeout = TimeSpan.FromHours(2); // Large files need extended timeout
+});
 
 // Register worker service
 builder.Services.AddHostedService<WorkerService>();
