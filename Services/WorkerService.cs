@@ -403,9 +403,10 @@ public class WorkerService : BackgroundService
             // Accept task
             await _hubConnection!.InvokeAsync("TaskAccepted", Guid.Parse(taskId));
 
-            // Extract task parameters
+            // Extract task parameters - now using chunk-based download
             var fileInfo = taskData.GetProperty("file");
-            var downloadUrl = fileInfo.GetProperty("download_url").GetString()!;
+            var chunkBaseUrl = fileInfo.GetProperty("chunk_base_url").GetString()!;
+            var chunkCount = fileInfo.GetProperty("chunk_count").GetInt32();
             var checksum = fileInfo.TryGetProperty("checksum", out var checksumProp)
                 ? checksumProp.GetString() ?? ""
                 : "";
@@ -431,10 +432,10 @@ public class WorkerService : BackgroundService
                 Model = validatedModel
             };
 
-            // Download file
-            _logger.LogInformation("Downloading file for task: {TaskId}", taskId);
+            // Download chunks and assemble file
+            _logger.LogInformation("Downloading {ChunkCount} chunks for task: {TaskId}", chunkCount, taskId);
             await SendProgressAsync(taskId, 0);
-            filePath = await _fileDownloader.DownloadAsync(downloadUrl, checksum, CancellationToken.None);
+            filePath = await _fileDownloader.DownloadChunksAndAssembleAsync(chunkBaseUrl, chunkCount, checksum, CancellationToken.None);
 
             // Process with Whisper
             _logger.LogInformation("Starting transcription with model: {Model}, language: {Language}",

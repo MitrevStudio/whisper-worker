@@ -16,7 +16,10 @@ public class FileDownloader
         Directory.CreateDirectory(_tempPath);
     }
 
-    public async Task<string> DownloadAsync(string url, string expectedChecksum, CancellationToken ct)
+    /// <summary>
+    /// Download chunks sequentially and assemble into a single file.
+    /// </summary>
+    public async Task<string> DownloadChunksAndAssembleAsync(string chunkBaseUrl, int chunkCount, string expectedChecksum, CancellationToken ct)
     {
         // Validate checksum is provided (mandatory for security)
         if (string.IsNullOrWhiteSpace(expectedChecksum))
@@ -27,44 +30,40 @@ public class FileDownloader
         var fileName = $"{Guid.NewGuid()}.wav";
         var filePath = Path.Combine(_tempPath, fileName);
 
-        using var response = await _httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
-        response.EnsureSuccessStatusCode();
+        long totalBytesDownloaded = 0;
 
-        // Validate content length before downloading
-        if (response.Content.Headers.ContentLength.HasValue)
+        await using (var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, BufferSizeBytes))
         {
-            if (response.Content.Headers.ContentLength > MaxDownloadSizeBytes)
+            for (int i = 0; i < chunkCount; i++)
             {
-                throw new InvalidOperationException(
-                    $"File size exceeds maximum allowed size of {MaxDownloadSizeBytes / (1024 * 1024 * 1024)} GB");
+                var chunkUrl = $"{chunkBaseUrl}/{i}";
+
+                using var response = await _httpClient.GetAsync(chunkUrl, HttpCompletionOption.ResponseHeadersRead, ct);
+                response.EnsureSuccessStatusCode();
+
+                await using var contentStream = await response.Content.ReadAsStreamAsync(ct);
+
+                byte[] buffer = new byte[BufferSizeBytes];
+                int bytesRead;
+                while ((bytesRead = await contentStream.ReadAsync(buffer, 0, buffer.Length, ct)) > 0)
+                {
+                    totalBytesDownloaded += bytesRead;
+
+                    // Enforce size limit during download (defense in depth)
+                    if (totalBytesDownloaded > MaxDownloadSizeBytes)
+                    {
+                        fileStream.Close();
+                        File.Delete(filePath);
+                        throw new InvalidOperationException(
+                            $"File size exceeds maximum allowed size of {MaxDownloadSizeBytes / (1024 * 1024 * 1024)} GB");
+                    }
+
+                    await fileStream.WriteAsync(buffer, 0, bytesRead, ct);
+                }
             }
+
+            await fileStream.FlushAsync(ct);
         }
-
-        long bytesDownloaded = 0;
-        await using var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None);
-        await using var contentStream = await response.Content.ReadAsStreamAsync(ct);
-
-        // Download with size validation
-        byte[] buffer = new byte[BufferSizeBytes];
-        int bytesRead;
-        while ((bytesRead = await contentStream.ReadAsync(buffer, 0, buffer.Length, ct)) > 0)
-        {
-            bytesDownloaded += bytesRead;
-
-            // Enforce size limit during download (defense in depth)
-            if (bytesDownloaded > MaxDownloadSizeBytes)
-            {
-                fileStream.Close();
-                File.Delete(filePath);
-                throw new InvalidOperationException(
-                    $"File size exceeds maximum allowed size of {MaxDownloadSizeBytes / (1024 * 1024 * 1024)} GB");
-            }
-
-            await fileStream.WriteAsync(buffer, 0, bytesRead, ct);
-        }
-
-        await fileStream.FlushAsync(ct);
-        fileStream.Close();
 
         // Verify checksum
         var actualChecksum = await ComputeChecksumAsync(filePath, ct);
