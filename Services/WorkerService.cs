@@ -434,8 +434,10 @@ public class WorkerService : BackgroundService
 
             // Download chunks and assemble file
             _logger.LogInformation("Downloading {ChunkCount} chunks for task: {TaskId}", chunkCount, taskId);
+            await SendDownloadStartedAsync(taskId);
             await SendProgressAsync(taskId, 0);
             filePath = await _fileDownloader.DownloadChunksAndAssembleAsync(chunkBaseUrl, chunkCount, checksum, CancellationToken.None);
+            await SendDownloadCompletedAsync(taskId);
 
             // Process with Whisper
             _logger.LogInformation("Starting transcription with model: {Model}, language: {Language}",
@@ -580,6 +582,30 @@ public class WorkerService : BackgroundService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to send rejection for task {TaskId}", taskId);
+        }
+    }
+
+    private async Task SendDownloadStartedAsync(string taskId)
+    {
+        try
+        {
+            await _hubConnection!.InvokeAsync("DownloadStarted", Guid.Parse(taskId));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send download started");
+        }
+    }
+
+    private async Task SendDownloadCompletedAsync(string taskId)
+    {
+        try
+        {
+            await _hubConnection!.InvokeAsync("DownloadCompleted", Guid.Parse(taskId));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send download completed");
         }
     }
 
