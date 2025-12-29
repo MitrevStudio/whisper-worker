@@ -30,6 +30,9 @@ public class WhisperProcessor : IDisposable
     private const float DefaultLogProbThreshold = -1.0f;     // Filter low-confidence outputs
     private const float DefaultTemperature = 0.0f;           // Deterministic output (less hallucination)
     private const float DefaultTemperatureInc = 0.2f;        // Gradual increase on retry
+    
+    // Context settings for long files - balance between quality and stability
+    private const int DefaultMaxLastTextTokens = 16;         // Limited context to prevent overflow (~2-3 sentences)
 
     // Supported audio extensions
     private static readonly HashSet<string> SupportedAudioExtensions = new(StringComparer.OrdinalIgnoreCase)
@@ -135,6 +138,10 @@ public class WhisperProcessor : IDisposable
         builder.WithLogProbThreshold(DefaultLogProbThreshold);
         builder.WithTemperature(DefaultTemperature);
         builder.WithTemperatureInc(DefaultTemperatureInc);
+        
+        // Limited context for long files - prevents overflow while maintaining some quality
+        // Using 16 tokens (~2-3 sentences) provides balance between context and stability
+        builder.WithMaxLastTextTokens(DefaultMaxLastTextTokens);
 
         await using var processor = builder.Build();
         
