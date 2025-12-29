@@ -1,5 +1,4 @@
 using FFMpegCore;
-using FFMpegCore.Pipes;
 using Microsoft.Extensions.Logging;
 using Whisper.net;
 using Whisper.net.Ggml;
@@ -17,9 +16,20 @@ public class WhisperProcessor : IDisposable
     private static readonly Dictionary<string, WhisperFactory> _factories = new();
     private static readonly object _factoryLock = new();
 
+    // Thread-safe progress tracking
     private int _lastLoggedProgress = -1;
     private static bool _runtimeConfigured = false;
     private static readonly object _runtimeLock = new();
+
+    // Hallucination detection constants
+    private const int MaxConsecutiveDuplicates = 2;
+    
+    // Anti-hallucination thresholds (tuned for large-v3-turbo)
+    private const float DefaultNoSpeechThreshold = 0.6f;
+    private const float DefaultEntropyThreshold = 2.4f;      // Filter low-entropy (repetitive) outputs
+    private const float DefaultLogProbThreshold = -1.0f;     // Filter low-confidence outputs
+    private const float DefaultTemperature = 0.0f;           // Deterministic output (less hallucination)
+    private const float DefaultTemperatureInc = 0.2f;        // Gradual increase on retry
 
     // Supported audio extensions
     private static readonly HashSet<string> SupportedAudioExtensions = new(StringComparer.OrdinalIgnoreCase)
@@ -61,19 +71,19 @@ public class WhisperProcessor : IDisposable
             if (hasCudaRuntime && OperatingSystem.IsLinux())
             {
                 // Force CUDA only - don't allow CPU fallback which can mask GPU issues
-                RuntimeOptions.RuntimeLibraryOrder = new List<RuntimeLibrary>
-                {
+                RuntimeOptions.RuntimeLibraryOrder =
+                [
                     RuntimeLibrary.Cuda
-                };
+                ];
                 _logger?.LogInformation("Whisper runtime configured for GPU acceleration (CUDA only)");
             }
             else
             {
                 // CPU fallback for non-GPU environments
-                RuntimeOptions.RuntimeLibraryOrder = new List<RuntimeLibrary>
-                {
+                RuntimeOptions.RuntimeLibraryOrder =
+                [
                     RuntimeLibrary.Cpu
-                };
+                ];
                 _logger?.LogInformation("Whisper runtime configured for CPU (no CUDA runtime found)");
             }
 
@@ -88,7 +98,7 @@ public class WhisperProcessor : IDisposable
         Action<TimeSpan, TimeSpan, string> onSegment,
         CancellationToken ct)
     {
-        _lastLoggedProgress = -1;
+        Interlocked.Exchange(ref _lastLoggedProgress, -1);
 
         var modelFile = GetModelFilePath(taskParams.Model);
         if (!File.Exists(modelFile))
@@ -97,98 +107,164 @@ public class WhisperProcessor : IDisposable
         }
 
         var factory = GetOrCreateFactory(modelFile);
-        await using var processor = factory.CreateBuilder()
+        var builder = factory.CreateBuilder()
             .WithLanguage(taskParams.Language == "auto" ? "auto" : taskParams.Language)
             .WithProgressHandler(progress =>
             {
-                if (progress != _lastLoggedProgress)
+                var lastProgress = Interlocked.Exchange(ref _lastLoggedProgress, progress);
+                if (progress != lastProgress)
                 {
                     _logger?.LogDebug("Processing progress: {Progress}%", progress);
-                    _lastLoggedProgress = progress;
                 }
                 onProgress(progress);
-            })
-            .WithSegmentEventHandler(segment =>
-            {
-                onSegment(segment.Start, segment.End, segment.Text ?? "");
-            })
-            .Build();
+            });
 
-        await using var audioStream = await ConvertToWhisperFormatAsync(audioPath, ct);
-        await foreach (var segment in processor.ProcessAsync(audioStream, ct))
+        // Configure thread count for optimal performance
+        var threadCount = taskParams.ThreadCount ?? Environment.ProcessorCount;
+        builder.WithThreads(threadCount);
+
+        // Enable translation to English if requested
+        if (taskParams.Translate)
         {
-            // Segments are already sent via the event handler callback
+            builder.WithTranslate();
+        }
+
+        // Anti-hallucination settings
+        builder.WithNoSpeechThreshold(DefaultNoSpeechThreshold);
+        builder.WithEntropyThreshold(DefaultEntropyThreshold);
+        builder.WithLogProbThreshold(DefaultLogProbThreshold);
+        builder.WithTemperature(DefaultTemperature);
+        builder.WithTemperatureInc(DefaultTemperatureInc);
+
+        await using var processor = builder.Build();
+        
+        // Convert to WAV file and use FileStream instead of MemoryStream
+        // This avoids memory issues with large files (1GB+ WAV data)
+        var tempWavPath = await ConvertToWhisperFormatAsync(audioPath, ct);
+        
+        try
+        {
+            // Use FileStream with optimized buffer size for large file reading
+            await using var audioStream = new FileStream(
+                tempWavPath, 
+                FileMode.Open, 
+                FileAccess.Read, 
+                FileShare.Read, 
+                bufferSize: 1024 * 1024,  // 1MB buffer for better sequential read performance
+                useAsync: true);
+            
+            _logger?.LogDebug("Processing audio file: {Size} bytes", audioStream.Length);
+            
+            // Track previous segment for hallucination detection
+            string? previousText = null;
+            int consecutiveDuplicates = 0;
+            
+            await foreach (var segment in processor.ProcessAsync(audioStream, ct))
+            {
+                var text = segment.Text?.Trim() ?? "";
+                
+                // Skip empty segments
+                if (string.IsNullOrWhiteSpace(text))
+                {
+                    continue;
+                }
+                
+                // Detect hallucination loop (same text repeated many times)
+                if (text == previousText)
+                {
+                    consecutiveDuplicates++;
+                    
+                    if (consecutiveDuplicates >= MaxConsecutiveDuplicates)
+                    {
+                        _logger?.LogWarning(
+                            "Hallucination detected: '{Text}' repeated {Count} times, skipping",
+                            text.Length > 50 ? text[..50] + "..." : text,
+                            consecutiveDuplicates + 1);
+                        continue;
+                    }
+                }
+                else
+                {
+                    consecutiveDuplicates = 0;
+                    previousText = text;
+                }
+                
+                onSegment(segment.Start, segment.End, text);
+            }
+        }
+        finally
+        {
+            // Clean up temp WAV file
+            if (File.Exists(tempWavPath))
+            {
+                try { File.Delete(tempWavPath); } catch { /* ignore cleanup errors */ }
+            }
         }
     }
 
     /// <summary>
     /// Converts audio/video file to 16kHz mono WAV format required by Whisper using FFmpeg.
-    /// Supports all audio and video formats that FFmpeg supports.
+    /// Returns the path to the temporary WAV file (caller must clean up).
+    /// Uses FFprobe for format detection instead of relying on file extension.
     /// </summary>
-    private async Task<MemoryStream> ConvertToWhisperFormatAsync(string inputPath, CancellationToken ct)
+    private async Task<string> ConvertToWhisperFormatAsync(string inputPath, CancellationToken ct)
     {
-        var extension = Path.GetExtension(inputPath);
-
-        if (!SupportedAudioExtensions.Contains(extension) && !SupportedVideoExtensions.Contains(extension))
+        // Use FFprobe to detect actual format instead of relying on extension
+        var mediaInfo = await FFProbe.AnalyseAsync(inputPath, cancellationToken: ct);
+        
+        if (mediaInfo.PrimaryAudioStream is null)
         {
-            throw new NotSupportedException(
-                $"Format '{extension}' is not supported. Supported audio formats: {string.Join(", ", SupportedAudioExtensions)}. " +
-                $"Supported video formats: {string.Join(", ", SupportedVideoExtensions)}");
+            throw new InvalidOperationException("No audio stream found in the media file");
         }
 
-        var isVideo = SupportedVideoExtensions.Contains(extension);
-        _logger?.LogDebug("Converting {MediaType} file to 16kHz mono WAV format", isVideo ? "video" : "audio");
+        var hasVideo = mediaInfo.PrimaryVideoStream is not null;
+        _logger?.LogDebug(
+            "Converting {MediaType} file to 16kHz mono WAV format. Detected format: {Format}, Duration: {Duration}",
+            hasVideo ? "video" : "audio",
+            mediaInfo.Format.FormatName,
+            mediaInfo.Duration);
 
-        var wavStream = new MemoryStream();
+        var tempWavPath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}.wav");
 
         try
         {
-            // Use a temporary file for the output since FFMpegCore works better with files
-            var tempWavPath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}.wav");
+            var result = await FFMpegArguments
+                .FromFileInput(inputPath)
+                .OutputToFile(tempWavPath, overwrite: true, options => options
+                    .WithAudioSamplingRate(16000)      // 16kHz sample rate
+                    .WithAudioCodec("pcm_s16le")       // 16-bit PCM
+                    .ForceFormat("wav")                 // WAV format
+                    .WithCustomArgument("-ac 1")        // Mono channel
+                    .WithCustomArgument("-vn"))         // No video (extract audio only)
+                .CancellableThrough(ct)
+                .ProcessAsynchronously();
 
-            try
+            if (!result)
             {
-                var result = await FFMpegArguments
-                    .FromFileInput(inputPath)
-                    .OutputToFile(tempWavPath, overwrite: true, options => options
-                        .WithAudioSamplingRate(16000)      // 16kHz sample rate
-                        .WithAudioCodec("pcm_s16le")       // 16-bit PCM
-                        .ForceFormat("wav")                 // WAV format
-                        .WithCustomArgument("-ac 1")        // Mono channel
-                        .WithCustomArgument("-vn"))         // No video (extract audio only)
-                    .CancellableThrough(ct)
-                    .ProcessAsynchronously();
-
-                if (!result)
-                {
-                    throw new InvalidOperationException("FFmpeg conversion failed");
-                }
-
-                // Read the temp file into memory stream
-                await using var fileStream = File.OpenRead(tempWavPath);
-                await fileStream.CopyToAsync(wavStream, ct);
+                throw new InvalidOperationException("FFmpeg conversion failed");
             }
-            finally
-            {
-                // Clean up temp file
-                if (File.Exists(tempWavPath))
-                {
-                    try { File.Delete(tempWavPath); } catch { /* ignore cleanup errors */ }
-                }
-            }
+
+            var fileInfo = new FileInfo(tempWavPath);
+            _logger?.LogDebug("Media conversion completed. WAV file size: {SizeBytes} bytes ({SizeMB:F1} MB)", 
+                fileInfo.Length, 
+                fileInfo.Length / (1024.0 * 1024.0));
+
+            return tempWavPath;
         }
         catch (Exception ex)
         {
+            // Clean up on failure
+            if (File.Exists(tempWavPath))
+            {
+                try { File.Delete(tempWavPath); } catch { }
+            }
+            
+            if (ex is InvalidOperationException)
+                throw;
+                
             throw new InvalidOperationException(
                 $"Failed to convert media file. Make sure FFmpeg is installed and available in PATH. Error: {ex.Message}", ex);
         }
-
-        // Reset stream position to beginning for reading
-        wavStream.Seek(0, SeekOrigin.Begin);
-
-        _logger?.LogDebug("Media conversion completed. Size: {SizeBytes} bytes", wavStream.Length);
-
-        return wavStream;
     }
 
     /// <summary>
@@ -218,10 +294,11 @@ public class WhisperProcessor : IDisposable
                 "small.en" => GgmlType.SmallEn,
                 "medium" => GgmlType.Medium,
                 "medium.en" => GgmlType.MediumEn,
-                "large" => GgmlType.LargeV3, // Defaulting large to V3
+                "large" => GgmlType.LargeV3Turbo,
                 "large-v1" => GgmlType.LargeV1,
                 "large-v2" => GgmlType.LargeV2,
                 "large-v3" => GgmlType.LargeV3,
+                "large-v3-turbo" or "turbo" => GgmlType.LargeV3Turbo,
                 _ => throw new ArgumentException($"Unknown model type: {modelName}")
             };
         }
@@ -236,7 +313,7 @@ public class WhisperProcessor : IDisposable
         }
 
         using var modelStream = await WhisperGgmlDownloader.Default.GetGgmlModelAsync(ggmlType, cancellationToken: ct);
-        using var fileWriter = File.OpenWrite(destinationPath);
+        await using var fileWriter = File.OpenWrite(destinationPath);
         await modelStream.CopyToAsync(fileWriter, ct);
         _logger?.LogInformation("Model downloaded successfully");
     }
@@ -282,10 +359,33 @@ public class WhisperProcessor : IDisposable
             .ToList();
     }
 
+    /// <summary>
+    /// Disposes all cached WhisperFactory instances.
+    /// Call this during application shutdown to properly release resources.
+    /// </summary>
+    public static void DisposeAllFactories()
+    {
+        lock (_factoryLock)
+        {
+            foreach (var factory in _factories.Values)
+            {
+                try
+                {
+                    factory.Dispose();
+                }
+                catch
+                {
+                    // Ignore disposal errors during shutdown
+                }
+            }
+            _factories.Clear();
+        }
+    }
+
     public void Dispose()
     {
         // Note: Static factories are intentionally NOT disposed here
         // They persist across WhisperProcessor instances for performance
-        // They will be cleaned up when the application shuts down
+        // Call DisposeAllFactories() during application shutdown for cleanup
     }
 }

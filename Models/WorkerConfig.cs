@@ -4,6 +4,16 @@ public record TaskParams
 {
     public required string Language { get; init; }
     public required string Model { get; init; }
+    
+    /// <summary>
+    /// Number of threads to use for processing. Defaults to Environment.ProcessorCount if not specified.
+    /// </summary>
+    public int? ThreadCount { get; init; }
+    
+    /// <summary>
+    /// If true, translates the audio to English instead of transcribing in the original language.
+    /// </summary>
+    public bool Translate { get; init; } = false;
 }
 
 public class WorkerConfig

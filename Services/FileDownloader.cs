@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Security.Cryptography;
 
 namespace Worker.Services;
@@ -8,6 +9,7 @@ public class FileDownloader
     private readonly string _tempPath;
     private const long MaxDownloadSizeBytes = 10L * 1024 * 1024 * 1024; // 10 GB
     private const int BufferSizeBytes = 64 * 1024; // 64 KB chunks
+    private const int MaxParallelDownloads = 4; // ????????? ????????
 
     public FileDownloader(HttpClient httpClient, string tempPath)
     {
@@ -17,11 +19,10 @@ public class FileDownloader
     }
 
     /// <summary>
-    /// Download chunks sequentially and assemble into a single file.
+    /// Download chunks in parallel and assemble into a single file.
     /// </summary>
     public async Task<string> DownloadChunksAndAssembleAsync(string chunkBaseUrl, int chunkCount, string expectedChecksum, CancellationToken ct)
     {
-        // Validate checksum is provided (mandatory for security)
         if (string.IsNullOrWhiteSpace(expectedChecksum))
         {
             throw new ArgumentException("Checksum is required for file verification", nameof(expectedChecksum));
@@ -29,65 +30,120 @@ public class FileDownloader
 
         var fileName = $"{Guid.NewGuid()}.wav";
         var filePath = Path.Combine(_tempPath, fileName);
+        var chunkFiles = new string[chunkCount];
 
-        long totalBytesDownloaded = 0;
-
-        await using (var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, BufferSizeBytes))
+        try
         {
-            for (int i = 0; i < chunkCount; i++)
-            {
-                var chunkUrl = $"{chunkBaseUrl}/{i}";
-
-                using var response = await _httpClient.GetAsync(chunkUrl, HttpCompletionOption.ResponseHeadersRead, ct);
-                response.EnsureSuccessStatusCode();
-
-                await using var contentStream = await response.Content.ReadAsStreamAsync(ct);
-
-                byte[] buffer = new byte[BufferSizeBytes];
-                int bytesRead;
-                while ((bytesRead = await contentStream.ReadAsync(buffer, 0, buffer.Length, ct)) > 0)
+            // ????????? ??????? ?? chunks
+            await Parallel.ForEachAsync(
+                Enumerable.Range(0, chunkCount),
+                new ParallelOptions
                 {
-                    totalBytesDownloaded += bytesRead;
+                    MaxDegreeOfParallelism = MaxParallelDownloads,
+                    CancellationToken = ct
+                },
+                async (i, token) =>
+                {
+                    chunkFiles[i] = await DownloadChunkAsync(chunkBaseUrl, i, token);
+                });
 
-                    // Enforce size limit during download (defense in depth)
-                    if (totalBytesDownloaded > MaxDownloadSizeBytes)
+            // ??????????? ? ??????????? ?? checksum ????????????
+            var actualChecksum = await AssembleChunksWithChecksumAsync(chunkFiles, filePath, ct);
+
+            // ???????? ?? checksum
+            var expected = expectedChecksum.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase)
+                ? expectedChecksum[7..]
+                : expectedChecksum;
+
+            if (!CryptographicOperations.FixedTimeEquals(
+                System.Text.Encoding.UTF8.GetBytes(actualChecksum.ToLowerInvariant()),
+                System.Text.Encoding.UTF8.GetBytes(expected.ToLowerInvariant())))
+            {
+                File.Delete(filePath);
+                throw new InvalidOperationException("Checksum verification failed");
+            }
+
+            return filePath;
+        }
+        finally
+        {
+            // ????????? ?? ?????????? chunk ???????
+            foreach (var chunkFile in chunkFiles)
+            {
+                if (!string.IsNullOrEmpty(chunkFile) && File.Exists(chunkFile))
+                {
+                    try { File.Delete(chunkFile); } catch { }
+                }
+            }
+        }
+    }
+
+    private async Task<string> DownloadChunkAsync(string chunkBaseUrl, int chunkIndex, CancellationToken ct)
+    {
+        var chunkUrl = $"{chunkBaseUrl}/{chunkIndex}";
+        var chunkPath = Path.Combine(_tempPath, $"{Guid.NewGuid()}.chunk");
+
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(BufferSizeBytes);
+        try
+        {
+            using var response = await _httpClient.GetAsync(chunkUrl, HttpCompletionOption.ResponseHeadersRead, ct);
+            response.EnsureSuccessStatusCode();
+
+            await using var contentStream = await response.Content.ReadAsStreamAsync(ct);
+            await using var fileStream = new FileStream(chunkPath, FileMode.Create, FileAccess.Write, FileShare.None, BufferSizeBytes, useAsync: true);
+
+            int bytesRead;
+            while ((bytesRead = await contentStream.ReadAsync(buffer.AsMemory(0, BufferSizeBytes), ct)) > 0)
+            {
+                await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), ct);
+            }
+
+            return chunkPath;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    private async Task<string> AssembleChunksWithChecksumAsync(string[] chunkFiles, string outputPath, CancellationToken ct)
+    {
+        long totalBytes = 0;
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(BufferSizeBytes);
+
+        try
+        {
+            using var sha256 = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            await using var outputStream = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None, BufferSizeBytes, useAsync: true);
+
+            foreach (var chunkFile in chunkFiles)
+            {
+                await using var chunkStream = new FileStream(chunkFile, FileMode.Open, FileAccess.Read, FileShare.Read, BufferSizeBytes, useAsync: true);
+
+                int bytesRead;
+                while ((bytesRead = await chunkStream.ReadAsync(buffer.AsMemory(0, BufferSizeBytes), ct)) > 0)
+                {
+                    totalBytes += bytesRead;
+
+                    if (totalBytes > MaxDownloadSizeBytes)
                     {
-                        fileStream.Close();
-                        File.Delete(filePath);
                         throw new InvalidOperationException(
                             $"File size exceeds maximum allowed size of {MaxDownloadSizeBytes / (1024 * 1024 * 1024)} GB");
                     }
 
-                    await fileStream.WriteAsync(buffer, 0, bytesRead, ct);
+                    // ????????? ? ???????? ????????????
+                    await outputStream.WriteAsync(buffer.AsMemory(0, bytesRead), ct);
+                    sha256.AppendData(buffer, 0, bytesRead);
                 }
             }
 
-            await fileStream.FlushAsync(ct);
+            await outputStream.FlushAsync(ct);
+            return Convert.ToHexString(sha256.GetHashAndReset()).ToLowerInvariant();
         }
-
-        // Verify checksum
-        var actualChecksum = await ComputeChecksumAsync(filePath, ct);
-        var expected = expectedChecksum.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase)
-            ? expectedChecksum[7..]
-            : expectedChecksum;
-
-        // Use constant-time comparison to prevent timing attacks
-        if (!CryptographicOperations.FixedTimeEquals(
-            System.Text.Encoding.UTF8.GetBytes(actualChecksum.ToLowerInvariant()),
-            System.Text.Encoding.UTF8.GetBytes(expected.ToLowerInvariant())))
+        finally
         {
-            File.Delete(filePath);
-            throw new InvalidOperationException("Checksum verification failed");
+            ArrayPool<byte>.Shared.Return(buffer);
         }
-
-        return filePath;
-    }
-
-    private static async Task<string> ComputeChecksumAsync(string filePath, CancellationToken ct)
-    {
-        await using var stream = File.OpenRead(filePath);
-        var hash = await SHA256.HashDataAsync(stream, ct);
-        return Convert.ToHexString(hash).ToLowerInvariant();
     }
 
     public void Cleanup(string filePath)

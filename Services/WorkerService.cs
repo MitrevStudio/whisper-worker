@@ -1,11 +1,9 @@
 using System.Text.Json;
-using System.Net.Http.Json;
 using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Worker.Models;
-using static System.Net.Mime.MediaTypeNames;
 
 namespace Worker.Services;
 
@@ -268,7 +266,7 @@ public class WorkerService : BackgroundService
                 options.AccessTokenProvider = () => Task.FromResult<string?>(_config.Token);
                 options.Headers.Add("Authorization", $"Bearer {_config.Token}");
             })
-            .WithAutomaticReconnect(new InfiniteRetryPolicy(_logger))
+            .WithAutomaticReconnect(new InfiniteRetryPolicy())
             .Build();
 
         // Setup handlers
@@ -318,7 +316,6 @@ public class WorkerService : BackgroundService
     // Custom reconnect policy that retries indefinitely with progressive delays
     private class InfiniteRetryPolicy : IRetryPolicy
     {
-        private readonly ILogger _logger;
         private static readonly TimeSpan[] _retryDelays =
         [
             TimeSpan.FromSeconds(0),
@@ -330,11 +327,6 @@ public class WorkerService : BackgroundService
             TimeSpan.FromMinutes(2),
             TimeSpan.FromMinutes(5)
         ];
-
-        public InfiniteRetryPolicy(ILogger logger)
-        {
-            _logger = logger;
-        }
 
         public TimeSpan? NextRetryDelay(RetryContext context)
         {
