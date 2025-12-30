@@ -395,13 +395,15 @@ public class WorkerService : BackgroundService
             // Accept task
             await _hubConnection!.InvokeAsync("TaskAccepted", Guid.Parse(taskId));
 
-            // Extract task parameters - now using chunk-based download
-            var fileInfo = taskData.GetProperty("file");
-            var chunkBaseUrl = fileInfo.GetProperty("chunk_base_url").GetString()!;
-            var chunkCount = fileInfo.GetProperty("chunk_count").GetInt32();
-            var checksum = fileInfo.TryGetProperty("checksum", out var checksumProp)
-                ? checksumProp.GetString() ?? ""
-                : "";
+            // All tasks are now file-based (API pre-converts everything to WAV chunks)
+            var sourceType = taskData.TryGetProperty("source_type", out var sourceTypeProp)
+                ? sourceTypeProp.GetString() ?? "file"
+                : "file";
+
+            if (sourceType != "file")
+            {
+                throw new InvalidOperationException($"Unsupported source type: {sourceType}. Worker only accepts pre-converted WAV chunks.");
+            }
 
             var paramsObj = taskData.GetProperty("params");
             var language = paramsObj.TryGetProperty("language", out var lang) ? lang.GetString() ?? "auto" : "auto";
@@ -424,11 +426,20 @@ public class WorkerService : BackgroundService
                 Model = validatedModel
             };
 
-            // Download chunks and assemble file
-            _logger.LogInformation("Downloading {ChunkCount} chunks for task: {TaskId}", chunkCount, taskId);
+            // Download WAV chunks from API
             await SendDownloadStartedAsync(taskId);
-            await SendProgressAsync(taskId, 0);
+            //await SendProgressAsync(taskId, 0);
+
+            var fileInfo = taskData.GetProperty("file");
+            var chunkBaseUrl = fileInfo.GetProperty("chunk_base_url").GetString()!;
+            var chunkCount = fileInfo.GetProperty("chunk_count").GetInt32();
+            var checksum = fileInfo.TryGetProperty("checksum", out var checksumProp)
+                ? checksumProp.GetString() ?? ""
+                : "";
+
+            _logger.LogInformation("Downloading {ChunkCount} WAV chunks for task: {TaskId}", chunkCount, taskId);
             filePath = await _fileDownloader.DownloadChunksAndAssembleAsync(chunkBaseUrl, chunkCount, checksum, CancellationToken.None);
+
             await SendDownloadCompletedAsync(taskId);
 
             // Process with Whisper
@@ -482,6 +493,7 @@ public class WorkerService : BackgroundService
         {
             if (filePath is not null)
             {
+                // Clean up downloaded file
                 _fileDownloader.Cleanup(filePath);
             }
             _currentTaskId = null;

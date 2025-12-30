@@ -9,7 +9,7 @@ public class FileDownloader
     private readonly string _tempPath;
     private const long MaxDownloadSizeBytes = 10L * 1024 * 1024 * 1024; // 10 GB
     private const int BufferSizeBytes = 64 * 1024; // 64 KB chunks
-    private const int MaxParallelDownloads = 4; // ????????? ????????
+    private const int MaxParallelDownloads = 4; // Maximum number of parallel downloads
 
     public FileDownloader(HttpClient httpClient, string tempPath)
     {
@@ -28,13 +28,13 @@ public class FileDownloader
             throw new ArgumentException("Checksum is required for file verification", nameof(expectedChecksum));
         }
 
+        // Output file is WAV (16kHz mono) from API
         var fileName = $"{Guid.NewGuid()}.wav";
         var filePath = Path.Combine(_tempPath, fileName);
         var chunkFiles = new string[chunkCount];
 
         try
         {
-            // ????????? ??????? ?? chunks
             await Parallel.ForEachAsync(
                 Enumerable.Range(0, chunkCount),
                 new ParallelOptions
@@ -47,10 +47,8 @@ public class FileDownloader
                     chunkFiles[i] = await DownloadChunkAsync(chunkBaseUrl, i, token);
                 });
 
-            // ??????????? ? ??????????? ?? checksum ????????????
             var actualChecksum = await AssembleChunksWithChecksumAsync(chunkFiles, filePath, ct);
 
-            // ???????? ?? checksum
             var expected = expectedChecksum.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase)
                 ? expectedChecksum[7..]
                 : expectedChecksum;
@@ -67,7 +65,6 @@ public class FileDownloader
         }
         finally
         {
-            // ????????? ?? ?????????? chunk ???????
             foreach (var chunkFile in chunkFiles)
             {
                 if (!string.IsNullOrEmpty(chunkFile) && File.Exists(chunkFile))

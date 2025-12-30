@@ -6,7 +6,6 @@
 # CUDA 13 base image for GPU support (whisper.net 1.9.0 requires CUDA 13)
 FROM nvidia/cuda:13.1.0-runtime-ubuntu22.04 AS base
 
-# Install .NET runtime and FFmpeg for audio/video conversion
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     ca-certificates \

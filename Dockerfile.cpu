@@ -3,12 +3,7 @@
 
 FROM mcr.microsoft.com/dotnet/runtime:10.0 AS base
 
-# Install FFmpeg for audio/video conversion
-RUN apt-get update && apt-get install -y \
-    ffmpeg \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
-
+# No external dependencies needed - FFmpeg and yt-dlp are now handled by the API
 WORKDIR /app
 
 # Create directories for models and temp files
