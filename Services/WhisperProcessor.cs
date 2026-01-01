@@ -83,7 +83,7 @@ public class WhisperProcessor : IDisposable
         string audioPath,
         TaskParams taskParams,
         Action<int> onProgress,
-        Action<TimeSpan, TimeSpan, string> onSegment,
+        Func<TimeSpan, TimeSpan, string, Task> onSegment,
         CancellationToken ct)
     {
         Interlocked.Exchange(ref _lastLoggedProgress, -1);
@@ -180,7 +180,7 @@ public class WhisperProcessor : IDisposable
                 previousText = text;
             }
 
-            onSegment(segment.Start, segment.End, text);
+            await onSegment(segment.Start, segment.End, text);
         }
     }
 
@@ -253,15 +253,65 @@ public class WhisperProcessor : IDisposable
         return Path.Combine(_modelPath, fileName);
     }
 
+    /// <summary>
+    /// Returns only the models currently loaded in memory (from the static factory cache).
+    /// </summary>
     public IEnumerable<string> GetAvailableModels()
     {
-        if (!Directory.Exists(_modelPath))
-            return [];
+        lock (_factoryLock)
+        {
+            return _factories.Keys
+                .Select(path => Path.GetFileNameWithoutExtension(path))
+                .Select(name => name.Replace("ggml-", ""))
+                .ToList();
+        }
+    }
 
-        return Directory.GetFiles(_modelPath, "ggml-*.bin")
-            .Select(f => Path.GetFileNameWithoutExtension(f))
-            .Select(n => n.Replace("ggml-", ""))
-            .ToList();
+    /// <summary>
+    /// Pre-downloads and loads all specified models into memory in parallel.
+    /// Call this at startup to ensure all models are ready before processing tasks.
+    /// </summary>
+    public async Task PreloadModelsAsync(IEnumerable<string> modelNames, CancellationToken ct)
+    {
+        var models = modelNames.ToList();
+        _logger?.LogInformation("Pre-loading {Count} models in parallel...", models.Count);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        // Download missing models in parallel
+        var downloadTasks = models.Select(async modelName =>
+        {
+            var modelFile = GetModelFilePath(modelName);
+            if (!File.Exists(modelFile))
+            {
+                _logger?.LogInformation("Downloading model: {Model}", modelName);
+                var downloadSw = System.Diagnostics.Stopwatch.StartNew();
+                await DownloadModelAsync(modelName, modelFile, ct);
+                _logger?.LogInformation("Model {Model} downloaded in {Elapsed:F1}s", modelName, downloadSw.Elapsed.TotalSeconds);
+            }
+            else
+            {
+                _logger?.LogInformation("Model {Model} already exists at {Path}", modelName, modelFile);
+            }
+            return modelFile;
+        });
+
+        var modelFiles = await Task.WhenAll(downloadTasks);
+
+        // Load models into memory in parallel
+        var loadTasks = modelFiles.Select(modelFile => Task.Run(() =>
+        {
+            var modelName = Path.GetFileNameWithoutExtension(modelFile).Replace("ggml-", "");
+            _logger?.LogInformation("Loading model {Model} into memory...", modelName);
+            var loadSw = System.Diagnostics.Stopwatch.StartNew();
+            GetOrCreateFactory(modelFile);
+            _logger?.LogInformation("Model {Model} loaded in {Elapsed:F1}s", modelName, loadSw.Elapsed.TotalSeconds);
+        }, ct));
+
+        await Task.WhenAll(loadTasks);
+
+        sw.Stop();
+        _logger?.LogInformation("All {Count} models pre-loaded in {Elapsed:F1}s. Models are cached in memory for fast inference.",
+            models.Count, sw.Elapsed.TotalSeconds);
     }
 
     public void Dispose()

@@ -8,10 +8,13 @@ services:
     environment:
       WORKER__Name: whisper-worker-gpu
       WORKER__ApiUrl: http://192.168.50.26:5239
-      WORKER__Token: "sk-worker-aQ1VH53Aktuw3UjwqcAn1L613E8FapOsnEqYBEnZ0VtvJ4Ef"
+      WORKER__Token: ""
       WORKER__ModelPath: /models
       WORKER__TempPath: /tmp/whisper
       WORKER__HeartbeatIntervalSeconds: 30
+      # Comma-separated list of models to download and load into memory at startup
+      WORKER__SupportedModels: turbo
+      WORKER__DefaultModel: turbo
     volumes:
       - whisper_models:/models
     deploy:
@@ -29,12 +32,15 @@ services:
       dockerfile: Dockerfile.cpu
     image: whisper-worker:cpu
     environment:
-      WORKER__Name: whisper-worker-cpu
+      WORKER__Name: whisper-cpu
       WORKER__ApiUrl: http://192.168.50.26:5239
-      WORKER__Token: "sk-worker-aQ1VH53Aktuw3UjwqcAn1L613E8FapOsnEqYBEnZ0VtvJ4Ef"
+      WORKER__Token: ""
       WORKER__ModelPath: /models
       WORKER__TempPath: /tmp/whisper
       WORKER__HeartbeatIntervalSeconds: 30
+      # Comma-separated list of models to download and load into memory at startup
+      WORKER__SupportedModels: tiny
+      WORKER__DefaultModel: tiny
     volumes:
       - whisper_models:/models
     profiles:

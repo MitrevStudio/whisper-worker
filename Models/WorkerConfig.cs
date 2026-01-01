@@ -4,12 +4,12 @@ public record TaskParams
 {
     public required string Language { get; init; }
     public required string Model { get; init; }
-    
+
     /// <summary>
     /// Number of threads to use for processing. Defaults to Environment.ProcessorCount if not specified.
     /// </summary>
     public int? ThreadCount { get; init; }
-    
+
     /// <summary>
     /// If true, translates the audio to English instead of transcribing in the original language.
     /// </summary>
@@ -38,6 +38,10 @@ public class WorkerConfig
         "sw", "ta", "te", "tg", "th", "tk", "tl", "tr", "tt", "uk", "ur", "uz", "vi", "yi", "yo", "zh"
     ];
 
-    public List<string> SupportedModels { get; set; } = ["tiny", "base", "small", "medium", "large"];
-    public string DefaultModel { get; set; } = "base";
+    // REQUIRED: Must be configured explicitly. No default - worker will not start without models.
+    // Configure via WORKER__SupportedModels__0, WORKER__SupportedModels__1, etc.
+    public List<string> SupportedModels { get; set; } = [];
+
+    // REQUIRED: Must be one of the models in SupportedModels.
+    public string DefaultModel { get; set; } = string.Empty;
 }

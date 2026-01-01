@@ -153,6 +153,44 @@ public class WorkerService : BackgroundService
             return false;
         }
 
+        // Validate SupportedModels is configured
+        if (_config.SupportedModels == null || _config.SupportedModels.Count == 0)
+        {
+            _logger.LogError("SupportedModels is not configured. Add models via WORKER__SupportedModels__0, WORKER__SupportedModels__1, etc.");
+            return false;
+        }
+
+        // Validate DefaultModel is configured and exists in SupportedModels
+        if (string.IsNullOrEmpty(_config.DefaultModel))
+        {
+            _logger.LogError("DefaultModel is not configured. Set via WORKER__DefaultModel.");
+            return false;
+        }
+
+        if (!_config.SupportedModels.Contains(_config.DefaultModel, StringComparer.OrdinalIgnoreCase))
+        {
+            _logger.LogError("DefaultModel '{DefaultModel}' is not in SupportedModels: [{Models}]",
+                _config.DefaultModel, string.Join(", ", _config.SupportedModels));
+            return false;
+        }
+
+        // Pre-download and load all configured models into memory
+        // This ensures fast inference by eliminating first-request latency
+        try
+        {
+            _logger.LogInformation("Pre-loading {Count} configured models: {Models}",
+                _config.SupportedModels.Count, string.Join(", ", _config.SupportedModels));
+
+            await _whisperProcessor.PreloadModelsAsync(_config.SupportedModels, ct);
+
+            _logger.LogInformation("Model preloading complete. Worker is ready for fast inference.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to preload models. Worker cannot start without models.");
+            return false;
+        }
+
         _logger.LogInformation("All startup checks passed");
         return true;
     }
@@ -272,6 +310,7 @@ public class WorkerService : BackgroundService
         // Setup handlers
         _hubConnection.On<string>("Registered", OnRegistered);
         _hubConnection.On<JsonElement>("ReceiveTask", OnReceiveTaskSafe);
+        _hubConnection.On<JsonElement>("ReceiveStreamingTask", OnReceiveStreamingTaskSafe);
 
         _hubConnection.Closed += OnConnectionClosed;
 
@@ -359,6 +398,151 @@ public class WorkerService : BackgroundService
     {
         // Fire and forget, but wrap to prevent unhandled exceptions from crashing the worker
         _ = HandleTaskSafelyAsync(taskElement);
+    }
+
+    private void OnReceiveStreamingTaskSafe(JsonElement taskElement)
+    {
+        // Fire and forget, but wrap to prevent unhandled exceptions from crashing the worker
+        _ = HandleStreamingTaskSafelyAsync(taskElement);
+    }
+
+    private async Task HandleStreamingTaskSafelyAsync(JsonElement taskElement)
+    {
+        string? sessionId = null;
+        int sequence = -1;
+        string? tempWavPath = null;
+
+        try
+        {
+            sessionId = taskElement.GetProperty("session_id").GetString()!;
+            sequence = taskElement.GetProperty("sequence").GetInt32();
+            var audioBase64 = taskElement.GetProperty("audio_data").GetString()!;
+
+            var paramsObj = taskElement.GetProperty("params");
+            var language = paramsObj.TryGetProperty("language", out var lang) ? lang.GetString() ?? "auto" : "auto";
+            var model = paramsObj.TryGetProperty("model", out var modelProp) ? modelProp.GetString() ?? _config.DefaultModel : _config.DefaultModel;
+
+            _logger.LogInformation("Received streaming task: session {SessionId}, sequence {Sequence}, language {Language}, model {Model}",
+                sessionId, sequence, language, model);
+
+            // Mark as busy
+            _state = WorkerState.Busy;
+
+            // Decode audio data
+            var audioBytes = Convert.FromBase64String(audioBase64);
+
+            // Write to temp file
+            tempWavPath = Path.Combine(_config.TempPath, $"streaming_{sessionId}_{sequence}.wav");
+            await File.WriteAllBytesAsync(tempWavPath, audioBytes);
+
+            // Validate task parameters
+            if (!ValidateLanguage(language, out var validatedLanguage))
+            {
+                validatedLanguage = "auto";
+            }
+
+            if (!ValidateModel(model, out var validatedModel))
+            {
+                _logger.LogWarning("Model '{Model}' not in supported list, falling back to '{Default}'", model, _config.DefaultModel);
+                validatedModel = _config.DefaultModel;
+            }
+
+            _logger.LogInformation("Using model: {Model} (original: {Original}, language: {Language})", validatedModel, model, validatedLanguage);
+
+            var taskParams = new TaskParams
+            {
+                Language = validatedLanguage,
+                Model = validatedModel
+            };
+
+            // Process with Whisper - send segments immediately as they're produced for real-time display
+            var segments = new List<(TimeSpan start, TimeSpan end, string text)>();
+            var segmentIndex = 0;
+
+            await _whisperProcessor.ProcessAsync(
+                tempWavPath,
+                taskParams,
+                progress => { }, // No progress for streaming
+                async (start, end, text) =>
+                {
+                    // Store for final result
+                    segments.Add((start, end, text));
+                    var currentIndex = segmentIndex++;
+
+                    // Send immediately to client for real-time display
+                    try
+                    {
+                        await _hubConnection!.InvokeAsync("StreamingSegment", new
+                        {
+                            SessionId = Guid.Parse(sessionId!),
+                            Sequence = sequence,
+                            SegmentIndex = currentIndex,
+                            Text = text.Trim(),
+                            StartSeconds = start.TotalSeconds,
+                            EndSeconds = end.TotalSeconds
+                        });
+                        _logger.LogInformation("Sent streaming segment {Index} for session {SessionId}: {Text}",
+                            currentIndex, sessionId, text.Trim().Length > 30 ? text.Trim()[..30] + "..." : text.Trim());
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to send streaming segment {Index}", currentIndex);
+                    }
+                },
+                CancellationToken.None);
+
+            // Combine all segments into one result
+            var fullText = string.Join(" ", segments.Select(s => s.text.Trim())).Trim();
+            var startSeconds = segments.Count > 0 ? segments[0].start.TotalSeconds : 0;
+            var endSeconds = segments.Count > 0 ? segments[^1].end.TotalSeconds : 0;
+
+            // Send result back to API
+            await _hubConnection!.InvokeAsync("StreamingResult", new
+            {
+                SessionId = Guid.Parse(sessionId),
+                Sequence = sequence,
+                Text = fullText,
+                IsFinal = true, // Each chunk produces a final result
+                StartSeconds = startSeconds,
+                EndSeconds = endSeconds
+            });
+
+            _logger.LogInformation("Streaming task completed: session {SessionId}, sequence {Sequence}, text: {Text}",
+                sessionId, sequence, fullText.Length > 50 ? fullText[..50] + "..." : fullText);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Streaming task failed: session {SessionId}, sequence {Sequence}", sessionId, sequence);
+
+            // Send empty result on error
+            if (sessionId != null && sequence >= 0)
+            {
+                try
+                {
+                    await _hubConnection!.InvokeAsync("StreamingResult", new
+                    {
+                        SessionId = Guid.Parse(sessionId),
+                        Sequence = sequence,
+                        Text = "",
+                        IsFinal = true,
+                        StartSeconds = 0.0,
+                        EndSeconds = 0.0
+                    });
+                }
+                catch { }
+            }
+        }
+        finally
+        {
+            // Clean up temp file
+            if (tempWavPath != null)
+            {
+                try { File.Delete(tempWavPath); } catch { }
+            }
+
+            _state = WorkerState.Idle;
+            _logger.LogDebug("Worker is now IDLE after streaming task");
+        }
     }
 
     private async Task HandleTaskSafelyAsync(JsonElement taskElement)
@@ -450,7 +634,7 @@ public class WorkerService : BackgroundService
                 filePath,
                 taskParams,
                 progress => _ = SendProgressAsync(taskId, progress),
-                (start, end, text) => _ = SendSegmentAsync(taskId, start, end, text),
+                async (start, end, text) => await SendSegmentAsync(taskId, start, end, text),
                 CancellationToken.None);
 
             // Send completion (segments already sent via callback, stored in Redis, will be persisted on completion)

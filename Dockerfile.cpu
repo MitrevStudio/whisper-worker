@@ -3,7 +3,12 @@
 
 FROM mcr.microsoft.com/dotnet/runtime:10.0 AS base
 
-# No external dependencies needed - FFmpeg and yt-dlp are now handled by the API
+# Install C++ runtime dependencies required by whisper.net native libraries
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Create directories for models and temp files
@@ -17,9 +22,8 @@ WORKDIR /src
 # Copy all source files first
 COPY . .
 
-# Remove CUDA references and add NoAvx runtime for CPU-only builds
-RUN sed -i '/Whisper.net.Runtime.Cuda/d' worker.csproj && \
-    dotnet add package Whisper.net.Runtime.NoAvx --version 1.9.0
+# Remove CUDA references - standard Whisper.net.Runtime has CPU support
+RUN sed -i '/Whisper.net.Runtime.Cuda/d' worker.csproj
 
 RUN dotnet restore "./worker.csproj"
 RUN dotnet build "./worker.csproj" -c $BUILD_CONFIGURATION -o /app/build --no-restore

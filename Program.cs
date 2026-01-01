@@ -20,6 +20,20 @@ if (!string.IsNullOrEmpty(workerToken))
     });
 }
 
+// Parse comma-separated SupportedModels from environment variable
+// This allows WORKER__SupportedModels: "turbo,base" instead of indexed format
+var supportedModels = builder.Configuration.GetValue<string>("Worker:SupportedModels");
+if (!string.IsNullOrEmpty(supportedModels) && !supportedModels.Contains("System.Collections"))
+{
+    var models = supportedModels.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    var modelConfig = new Dictionary<string, string?>();
+    for (int i = 0; i < models.Length; i++)
+    {
+        modelConfig[$"Worker:SupportedModels:{i}"] = models[i];
+    }
+    builder.Configuration.AddInMemoryCollection(modelConfig);
+}
+
 builder.Services.Configure<WorkerConfig>(builder.Configuration.GetSection("Worker"));
 
 // Register HttpClient with extended timeout for large file downloads
